@@ -47,6 +47,11 @@ final class AppSettings {
         didSet { defaults.set(largeExportThresholdDays, forKey: Keys.thresholdDays) }
     }
 
+    /// 导出 JSON 是否包含每条样本的 HealthKit UUID（用于接收端精确去重；会显著增大文件，默认关）。
+    var includeUUID: Bool {
+        didSet { defaults.set(includeUUID, forKey: Keys.includeUUID) }
+    }
+
     var hasEndpoint: Bool {
         !endpoint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
@@ -69,6 +74,7 @@ final class AppSettings {
         self.lastSyncDate = defaults.object(forKey: Keys.lastSyncDate) as? Date
         let storedThreshold = defaults.object(forKey: Keys.thresholdDays) as? Int
         self.largeExportThresholdDays = storedThreshold ?? 3
+        self.includeUUID = defaults.object(forKey: Keys.includeUUID) as? Bool ?? false
     }
 
     private enum Keys {
@@ -77,5 +83,6 @@ final class AppSettings {
         static let selectedMetrics = "settings.selectedMetrics"
         static let lastSyncDate = "settings.lastSyncDate"
         static let thresholdDays = "settings.thresholdDays"
+        static let includeUUID = "settings.includeUUID"
     }
 }
