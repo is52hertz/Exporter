@@ -8,7 +8,8 @@
 import Foundation
 
 /// 归一化后的单条健康样本。quantity 样本填 `value`+`unit`；category 样本填 `stringValue`。
-struct HealthSample: Codable, Identifiable, Hashable {
+/// 标记 nonisolated：纯数据 + Codable，需在后台线程编码，不应受默认 MainActor 隔离约束。
+nonisolated struct HealthSample: Codable, Identifiable, Hashable, Sendable {
     /// 指标标识，对应 HealthMetric.rawValue，如 "stepCount" / "sleepAnalysis"。
     let type: String
     /// 数据大类：activity / vitals / body / sleep。

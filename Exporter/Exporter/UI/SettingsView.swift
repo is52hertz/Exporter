@@ -27,6 +27,16 @@ struct SettingsView: View {
                 } footer: {
                     Text("留空则只在本机预览 / 分享，不发送。Authorization 头会原样写入请求，例如 “Bearer 你的令牌”。")
                 }
+
+                Section {
+                    Stepper(value: $settings.largeExportThresholdDays, in: 1...30) {
+                        Text("大导出确认阈值：\(settings.largeExportThresholdDays) 天")
+                    }
+                } header: {
+                    Text("导出")
+                } footer: {
+                    Text("导出数据跨度超过该天数时，会先弹出确认，可选择继续全部或仅最近 \(settings.largeExportThresholdDays) 天。")
+                }
             }
             .navigationTitle("设置")
             .navigationBarTitleDisplayMode(.inline)

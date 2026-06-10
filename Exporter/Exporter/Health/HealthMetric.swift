@@ -10,7 +10,7 @@
 import Foundation
 
 /// 数据大类，用于在 JSON 中分组与 UI 分区。
-enum HealthCategory: String, Codable, CaseIterable, Identifiable {
+nonisolated enum HealthCategory: String, Codable, CaseIterable, Identifiable, Sendable {
     case activity   // 活动 / 健身
     case vitals     // 生命体征
     case body       // 身体测量
@@ -29,7 +29,7 @@ enum HealthCategory: String, Codable, CaseIterable, Identifiable {
 }
 
 /// 单个健康指标的描述符。新增指标只需在此添加一个 case 并补全映射。
-enum HealthMetric: String, CaseIterable, Identifiable, Codable {
+nonisolated enum HealthMetric: String, CaseIterable, Identifiable, Codable, Sendable {
     case stepCount
     case activeEnergyBurned
     case heartRate

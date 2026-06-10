@@ -8,11 +8,11 @@
 import Foundation
 
 /// 将已编码的 JSON 负载发送到目的地。
-protocol ExportSender {
+nonisolated protocol ExportSender: Sendable {
     func send(_ data: Data) async throws
 }
 
-enum SenderError: LocalizedError {
+nonisolated enum SenderError: LocalizedError {
     case missingEndpoint
     case invalidURL(String)
     case httpStatus(Int, body: String?)
@@ -30,7 +30,7 @@ enum SenderError: LocalizedError {
 }
 
 /// 通过 HTTP POST 发送 JSON。endpoint 与可选 Authorization 头来自 AppSettings。
-struct HTTPSender: ExportSender {
+nonisolated struct HTTPSender: ExportSender {
     let endpoint: String
     let authorizationHeader: String?
     var session: URLSession = .shared

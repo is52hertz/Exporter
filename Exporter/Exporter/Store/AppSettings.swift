@@ -37,6 +37,16 @@ final class AppSettings {
     var rangeStart: Date
     var rangeEnd: Date
 
+    /// 上次成功的全量增量同步时间（仅全量增量更新；局部读取不更新）。
+    var lastSyncDate: Date? {
+        didSet { defaults.set(lastSyncDate, forKey: Keys.lastSyncDate) }
+    }
+
+    /// 导出跨度超过该天数时弹确认（默认 3 天）。
+    var largeExportThresholdDays: Int {
+        didSet { defaults.set(largeExportThresholdDays, forKey: Keys.thresholdDays) }
+    }
+
     var hasEndpoint: Bool {
         !endpoint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
@@ -55,11 +65,17 @@ final class AppSettings {
         let now = Date()
         self.rangeEnd = now
         self.rangeStart = Calendar.current.date(byAdding: .day, value: -7, to: now) ?? now
+
+        self.lastSyncDate = defaults.object(forKey: Keys.lastSyncDate) as? Date
+        let storedThreshold = defaults.object(forKey: Keys.thresholdDays) as? Int
+        self.largeExportThresholdDays = storedThreshold ?? 3
     }
 
     private enum Keys {
         static let endpoint = "settings.endpoint"
         static let authHeader = "settings.authHeader"
         static let selectedMetrics = "settings.selectedMetrics"
+        static let lastSyncDate = "settings.lastSyncDate"
+        static let thresholdDays = "settings.thresholdDays"
     }
 }

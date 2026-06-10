@@ -8,7 +8,7 @@
 import Foundation
 
 /// 同步模式：增量（基于 anchor）或指定日期段。
-enum SyncMode: String, Codable, CaseIterable, Identifiable {
+nonisolated enum SyncMode: String, Codable, CaseIterable, Identifiable, Sendable {
     case incremental
     case range
 
@@ -23,7 +23,7 @@ enum SyncMode: String, Codable, CaseIterable, Identifiable {
 }
 
 /// 导出负载顶层结构，可被 JSONExporter 编码。
-struct ExportEnvelope: Codable {
+nonisolated struct ExportEnvelope: Codable, Sendable {
     /// schema 版本，便于接收方兼容演进。
     let schemaVersion: Int
     let exportedAt: Date

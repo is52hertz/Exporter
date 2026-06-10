@@ -30,6 +30,10 @@ struct ContentView: View {
                     }
                 }
             }
+            .task {
+                await model.refreshAuthorizationState()
+                await model.refreshProbes()
+            }
             .sheet(isPresented: $showSettings) {
                 SettingsView(settings: model.settings)
             }
@@ -41,11 +45,20 @@ struct ContentView: View {
             } message: {
                 Text(model.errorMessage ?? "")
             }
+            .alert("管理健康权限", isPresented: $model.showAuthSettingsAlert) {
+                Button("去设置") { model.openSystemSettings() }
+                Button("好", role: .cancel) {}
+            } message: {
+                Text("授权面板只能由系统首次弹出。如需更改读取权限，请在「设置 → 隐私与安全性 → 健康」或「健康 App → 共享」中调整。")
+            }
             .disabled(model.isWorking)
             .overlay {
                 if model.isWorking {
                     ProgressView().controlSize(.large)
                 }
+            }
+            .overlay {
+                confirmOverlay
             }
         }
     }
@@ -55,17 +68,18 @@ struct ContentView: View {
     private var authSection: some View {
         Section {
             Button {
-                Task { await model.requestAuthorization() }
+                Task { await model.handleAuthorizationTap() }
             } label: {
-                Label("请求健康数据授权", systemImage: "heart.text.square")
+                Label(model.authorizationDetermined ? "健康权限已设置（点此管理）" : "请求健康数据授权",
+                      systemImage: "heart.text.square")
             }
         } footer: {
-            Text("仅读取你授权的数据。HealthKit 不会向 App 透露你“拒绝”了哪些项，读取结果取决于实际授权。")
+            Text("仅读取你授权的数据。HealthKit 不会告知 App 你“拒绝”了哪些项；下方各指标显示的是探测到的最近数据。")
         }
     }
 
     private var modeSection: some View {
-        Section("时间范围") {
+        Section {
             Picker("模式", selection: modeBinding) {
                 ForEach(SyncMode.allCases) { mode in
                     Text(mode.displayName).tag(mode)
@@ -79,6 +93,12 @@ struct ContentView: View {
                 DatePicker("结束", selection: rangeEndBinding,
                            in: model.settings.rangeStart..., displayedComponents: [.date, .hourAndMinute])
             }
+        } header: {
+            Text("时间范围")
+        } footer: {
+            if model.settings.mode == .incremental {
+                Text(incrementalSyncText)
+            }
         }
     }
 
@@ -89,7 +109,7 @@ struct ContentView: View {
                     Label {
                         VStack(alignment: .leading, spacing: 2) {
                             Text(metric.displayName)
-                            Text(metric.category.displayName)
+                            Text(subtitle(for: metric))
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
@@ -104,7 +124,7 @@ struct ContentView: View {
     private var actionSection: some View {
         Section {
             Button {
-                Task { await model.readAndPreview() }
+                model.startExport()
             } label: {
                 Label("读取并预览 JSON", systemImage: "doc.text.magnifyingglass")
                     .frame(maxWidth: .infinity)
@@ -114,6 +134,65 @@ struct ContentView: View {
         } footer: {
             if let status = model.statusMessage {
                 Text(status)
+            }
+        }
+    }
+
+    // MARK: 大导出确认弹层
+
+    @ViewBuilder
+    private var confirmOverlay: some View {
+        if let confirm = model.confirm {
+            ZStack {
+                Color.black.opacity(0.3).ignoresSafeArea()
+                VStack(spacing: 16) {
+                    Text("数据较多")
+                        .font(.headline)
+                    Text(confirm.spanText)
+                        .font(.subheadline)
+                        .multilineTextAlignment(.center)
+                        .foregroundStyle(.secondary)
+
+                    if let count = confirm.estimatedCount {
+                        Text("约 \(count) 条样本")
+                            .font(.subheadline.weight(.medium))
+                            .contentTransition(.numericText())
+                    } else {
+                        HStack(spacing: 6) {
+                            ProgressView().controlSize(.small)
+                            Text("估算中…").foregroundStyle(.secondary)
+                        }
+                        .font(.subheadline)
+                    }
+
+                    VStack(spacing: 10) {
+                        Button {
+                            model.confirmContinueAll()
+                        } label: {
+                            Text("继续全部").frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.glassProminent)
+                        .disabled(confirm.estimatedCount == nil)
+
+                        Button {
+                            model.confirmRecentOnly()
+                        } label: {
+                            Text("仅最近 \(confirm.recentDays) 天").frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.glass)
+
+                        Button(role: .cancel) {
+                            model.confirmCancel()
+                        } label: {
+                            Text("取消").frame(maxWidth: .infinity)
+                        }
+                    }
+                    .padding(.top, 4)
+                }
+                .padding(24)
+                .frame(maxWidth: 320)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 24))
+                .padding(40)
             }
         }
     }
@@ -128,6 +207,24 @@ struct ContentView: View {
                 else { model.settings.selectedMetrics.remove(metric) }
             }
         )
+    }
+
+    private func subtitle(for metric: HealthMetric) -> String {
+        let base = metric.category.displayName
+        guard model.hasProbed else { return base }
+        if let date = model.probeDates[metric] {
+            return base + " · 最近 " + date.formatted(.relative(presentation: .named))
+        } else {
+            return base + " · 无数据或未授权"
+        }
+    }
+
+    private var incrementalSyncText: String {
+        if let date = model.settings.lastSyncDate {
+            return "上次同步：" + date.formatted(date: .abbreviated, time: .shortened)
+        } else {
+            return "尚未同步过（将导出全部历史）"
+        }
     }
 
     private var modeBinding: Binding<SyncMode> {

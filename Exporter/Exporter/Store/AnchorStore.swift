@@ -9,7 +9,7 @@ import Foundation
 #if canImport(HealthKit)
 import HealthKit
 
-struct AnchorStore {
+nonisolated struct AnchorStore {
     private let defaults: UserDefaults
 
     init(defaults: UserDefaults = .standard) {
@@ -26,7 +26,17 @@ struct AnchorStore {
     func save(_ anchor: HKQueryAnchor, for metric: HealthMetric) {
         guard let data = try? NSKeyedArchiver.archivedData(withRootObject: anchor,
                                                            requiringSecureCoding: true) else { return }
+        saveArchivedAnchor(data, for: metric)
+    }
+
+    /// 保存已归档的 anchor 数据（用于延迟提交：查询时归档，确认后才落盘）。
+    func saveArchivedAnchor(_ data: Data, for metric: HealthMetric) {
         defaults.set(data, forKey: key(for: metric))
+    }
+
+    /// 将 anchor 归档为 Data，便于跨任务边界传递（Sendable）。
+    static func archive(_ anchor: HKQueryAnchor) -> Data? {
+        try? NSKeyedArchiver.archivedData(withRootObject: anchor, requiringSecureCoding: true)
     }
 
     func reset(_ metric: HealthMetric) {
