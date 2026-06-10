@@ -34,6 +34,8 @@ final class ExportModel {
     // 授权
     var authorizationDetermined = false
     var showAuthSettingsAlert = false
+    /// 请求前的多面板流程说明（健康数据 + 用药 + 验光处方共三个系统面板依次弹出）。
+    var showAuthFlowNotice = false
 
     // 各指标最近样本时间（保守探测：有=已授权且有数据；无=未授权或无数据）。
     // 懒探测：展开某分类时才查询该组，结果缓存；probedCategories 记录已探测的分类。
@@ -92,17 +94,22 @@ final class ExportModel {
         }
     }
 
-    /// 未决 → 弹系统授权面板；已决 → 弹说明（引导去设置）。
-    func handleAuthorizationTap() async {
+    /// 未决 → 先弹流程说明（授权分三个系统面板）；已决 → 弹说明（引导去设置）。
+    func handleAuthorizationTap() {
         if authorizationDetermined {
             showAuthSettingsAlert = true
-            return
+        } else {
+            showAuthFlowNotice = true
         }
+    }
+
+    /// 用户确认流程说明后实际发起授权（依次弹出健康数据 / 用药 / 验光处方面板）。
+    func proceedAuthorization() async {
         errorMessage = nil
         do {
             try await health.requestAuthorization(for: HealthMetric.registered)
             settings.hasRequestedAuthorization = true
-            statusMessage = "已发起授权请求。"
+            statusMessage = "授权流程已完成。"
         } catch {
             errorMessage = error.localizedDescription
         }

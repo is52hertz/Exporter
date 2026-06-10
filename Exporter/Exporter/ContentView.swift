@@ -68,13 +68,21 @@ struct ContentView: View {
     private var authSection: some View {
         Section {
             Button {
-                Task { await model.handleAuthorizationTap() }
+                model.handleAuthorizationTap()
             } label: {
                 Label(model.authorizationDetermined ? "健康权限已设置（点此管理）" : "请求健康数据授权",
                       systemImage: "heart.text.square")
             }
         } footer: {
             Text("仅读取你授权的数据。HealthKit 不会告知 App 你“拒绝”了哪些项；下方各指标显示的是探测到的最近数据。")
+        }
+        .alert("将弹出 3 个授权面板", isPresented: $model.showAuthFlowNotice) {
+            Button("开始授权") {
+                Task { await model.proceedAuthorization() }
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("系统会依次弹出 3 个授权请求：① 健康与健身数据（项目较多，可用顶部“全部打开”）；② 用药记录（按药物授权）；③ 验光处方。请逐一确认。")
         }
     }
 
