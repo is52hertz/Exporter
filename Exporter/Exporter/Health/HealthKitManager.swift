@@ -211,6 +211,8 @@ final class HealthKitManager {
         let samples: [HealthSample]
         let pendingAnchors: [PendingAnchor]
         let isIncremental: Bool
+        /// 因授权未决/被拒而跳过的指标（授权面板可能隐藏部分类型，无法授予）。
+        let skippedMetrics: [HealthMetric]
 
         struct PendingAnchor: Sendable {
             let metric: HealthMetric
@@ -226,7 +228,7 @@ final class HealthKitManager {
                            end: Date?,
                            maxLookback: TimeInterval? = nil) async throws -> FetchOutcome {
         guard isHealthDataAvailable else { throw HealthError.unavailable }
-        typealias Part = (samples: [HealthSample], anchor: FetchOutcome.PendingAnchor?)
+        typealias Part = (samples: [HealthSample], anchor: FetchOutcome.PendingAnchor?, skipped: HealthMetric?)
         return try await withThrowingTaskGroup(of: Part.self) { group in
             func submit(_ metric: HealthMetric, to group: inout ThrowingTaskGroup<Part, Error>) {
                 group.addTask {
@@ -235,14 +237,15 @@ final class HealthKitManager {
                         case .incremental:
                             let (samples, anchorData) = try await self.fetchIncremental(metric, maxLookback: maxLookback)
                             let pending = anchorData.map { FetchOutcome.PendingAnchor(metric: metric, anchorData: $0) }
-                            return (samples, pending)
+                            return (samples, pending, nil)
                         case .range:
                             let samples = try await self.fetchRange(metric, start: start, end: end, maxLookback: maxLookback)
-                            return (samples, nil)
+                            return (samples, nil, nil)
                         }
-                    } catch where Self.isPerObjectAuthorized(metric) {
-                        // 逐对象授权类型（视力处方/用药）未授权时查询会报错：跳过该指标，不影响整体导出。
-                        return ([], nil)
+                    } catch where Self.shouldSkip(error, metric: metric) {
+                        // 授权未决/被拒（授权面板可能隐藏部分类型）或逐对象授权类型未授权：
+                        // 跳过该指标并上报，不让单个指标炸掉整体导出。
+                        return ([], nil, metric)
                     }
                 }
             }
@@ -255,9 +258,11 @@ final class HealthKitManager {
 
             var all: [HealthSample] = []
             var anchors: [FetchOutcome.PendingAnchor] = []
+            var skipped: [HealthMetric] = []
             while let part = try await group.next() {
                 all += part.samples
                 if let anchor = part.anchor { anchors.append(anchor) }
+                if let metric = part.skipped { skipped.append(metric) }
                 if nextIndex < metrics.count {
                     submit(metrics[nextIndex], to: &group)
                     nextIndex += 1
@@ -265,8 +270,21 @@ final class HealthKitManager {
             }
             return FetchOutcome(samples: all.sorted { $0.start < $1.start },
                                 pendingAnchors: anchors,
-                                isIncremental: mode == .incremental)
+                                isIncremental: mode == .incremental,
+                                skippedMetrics: skipped)
         }
+    }
+
+    /// 单指标查询失败是否应跳过（而非让整体导出失败）：
+    /// 授权未决/被拒的指标（部分类型不出现在授权面板，用户无法授予），
+    /// 以及逐对象授权类型（视力处方/用药）的任何错误。
+    private nonisolated static func shouldSkip(_ error: Error, metric: HealthMetric) -> Bool {
+        if isPerObjectAuthorized(metric) { return true }
+        if let hkError = error as? HKError {
+            return hkError.code == .errorAuthorizationNotDetermined
+                || hkError.code == .errorAuthorizationDenied
+        }
+        return false
     }
 
     /// 提交一次增量读取的 anchor（仅在用户确认导出后调用）。

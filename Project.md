@@ -216,6 +216,7 @@ xcrun simctl io booted screenshot /tmp/shot.png
 - **SourceKit 跨文件索引滞后**：在 Xcode 之外用工具新增/改文件后，编辑器常报「Cannot find type X in scope」误报，但 `xcodebuild` 干净通过。处理：`⌘B` 重新编译 / `⇧⌘K` 清理 / 重开工程。**以 `xcodebuild` 结果为准，别被实时报错带偏。**
 - **逐对象授权类型会炸标准授权 API**：把 `visionPrescriptionType` / `medicationDoseEventType` 放进 `requestAuthorization` 或 `getRequestStatusForAuthorization` 的读集合 → HealthKit 抛 `NSInvalidArgumentException`（启动即崩，曾踩）。必须走 `requestPerObjectReadAuthorization`（用药目标是 `userAnnotatedMedicationType`），并对这两类的查询失败做容错。`requiresPerObjectAuthorization()` 对 dose event 类型返回 false，不能只靠它过滤 —— 需按 kind 显式排除。
 - **历史更名标识符**：`environmentalAudioExposureEvent` 的原始字符串仍是 `HKCategoryTypeIdentifierAudioExposureEvent`；机械拼接标识符时需特例表（另有 `VO2Max`/`UVExposure` 大小写）。单测 `everyMetricResolvesToSampleType` 全量守护。
+- **部分类型授权面板不展示（真机踩坑）**：地区/设备功能限制下个别类型（如问卷评估、房颤负荷等）不会出现在授权面板，用户无法授予 → 该类型永远 `notDetermined`：① `getRequestStatusForAuthorization` 对全集永远返回 `shouldRequest`（授权按钮状态需用 `settings.hasRequestedAuthorization` 持久化兜底）；② 查询抛 `errorAuthorizationNotDetermined`（fetch 必须按指标跳过并上报 `skippedMetrics`，不能让单指标炸掉整体导出）。真机现象：授予全部权限后导出仍弹 "Authorization not determined"、按钮不变「管理」。
 - 同步文件夹下别手动往 pbxproj 加源文件引用（会重复）。
 - `AGENTS.md`（及其符号链接 `CLAUDE.md`）曾是从别的仓库复制来的，已重写为本项目约定。
 - 提交前确认 `xcuserdata/` 未被纳入（已 gitignore）。

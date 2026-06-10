@@ -52,6 +52,12 @@ final class AppSettings {
         didSet { defaults.set(includeUUID, forKey: Keys.includeUUID) }
     }
 
+    /// 是否已成功发起过一次授权请求。部分类型不出现在授权面板（地区/设备功能限制），
+    /// 导致 getRequestStatusForAuthorization 永远返回 shouldRequest —— 用该标记兜底判定「已决」。
+    var hasRequestedAuthorization: Bool {
+        didSet { defaults.set(hasRequestedAuthorization, forKey: Keys.hasRequestedAuth) }
+    }
+
     var hasEndpoint: Bool {
         !endpoint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
@@ -75,6 +81,7 @@ final class AppSettings {
         let storedThreshold = defaults.object(forKey: Keys.thresholdDays) as? Int
         self.largeExportThresholdDays = storedThreshold ?? 3
         self.includeUUID = defaults.object(forKey: Keys.includeUUID) as? Bool ?? false
+        self.hasRequestedAuthorization = defaults.bool(forKey: Keys.hasRequestedAuth)
     }
 
     private enum Keys {
@@ -84,5 +91,6 @@ final class AppSettings {
         static let lastSyncDate = "settings.lastSyncDate"
         static let thresholdDays = "settings.thresholdDays"
         static let includeUUID = "settings.includeUUID"
+        static let hasRequestedAuth = "settings.hasRequestedAuthorization"
     }
 }

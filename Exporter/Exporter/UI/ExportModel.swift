@@ -83,7 +83,13 @@ final class ExportModel {
     // MARK: 授权
 
     func refreshAuthorizationState() async {
-        authorizationDetermined = await health.isAuthorizationDetermined(for: HealthMetric.registered)
+        // 部分类型不出现在授权面板（地区/设备功能限制），系统状态会永远停在 shouldRequest；
+        // 已成功请求过一次即视为已决（再请求面板也不会出现这些类型）。
+        if settings.hasRequestedAuthorization {
+            authorizationDetermined = true
+        } else {
+            authorizationDetermined = await health.isAuthorizationDetermined(for: HealthMetric.registered)
+        }
     }
 
     /// 未决 → 弹系统授权面板；已决 → 弹说明（引导去设置）。
@@ -95,6 +101,7 @@ final class ExportModel {
         errorMessage = nil
         do {
             try await health.requestAuthorization(for: HealthMetric.registered)
+            settings.hasRequestedAuthorization = true
             statusMessage = "已发起授权请求。"
         } catch {
             errorMessage = error.localizedDescription
@@ -300,7 +307,13 @@ final class ExportModel {
             metricCounts = artifact.metricCounts
             dataStart = artifact.dataStart
             dataEnd = artifact.dataEnd
-            statusMessage = "读取到 \(artifact.sampleCount) 条样本。"
+            var message = "读取到 \(artifact.sampleCount) 条样本。"
+            if !outcome.skippedMetrics.isEmpty {
+                let names = outcome.skippedMetrics.prefix(3).map(\.displayName).joined(separator: "、")
+                let suffix = outcome.skippedMetrics.count > 3 ? " 等" : ""
+                message += "跳过 \(outcome.skippedMetrics.count) 项未授权指标（\(names)\(suffix)）。"
+            }
+            statusMessage = message
             showPreview = true
         } catch {
             errorMessage = error.localizedDescription
