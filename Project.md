@@ -39,51 +39,64 @@ Exporter/Exporter/
     HealthKitManager.swift     授权 + 查询 + 探测 + HK 映射扩展（@MainActor 类，查询方法 nonisolated）
   Model/
     HealthSample.swift         归一化中间模型（nonisolated Codable Sendable）
-    ExportEnvelope.swift       JSON 顶层信封 + SyncMode（nonisolated Sendable）
+    ExportDocument.swift       schema v2 顶层文档：按指标分组 + columns/rows + 来源索引表
+    SyncMode.swift             同步模式枚举（增量 / 日期段）
   Export/
-    JSONExporter.swift         编码（nonisolated）
+    JSONExporter.swift         自定义字符串序列化器（nonisolated，row 单行紧凑排版）
     Sender.swift               ExportSender 协议 + HTTPSender + SenderError（nonisolated）
   Store/
     AnchorStore.swift          增量 anchor 持久化（nonisolated struct，UserDefaults）
     AppSettings.swift          @MainActor @Observable 用户配置
   UI/
     ExportModel.swift          @MainActor @Observable，UI 状态/流程单一来源
-    JSONPreviewView.swift      预览 sheet + ShareLink + 发送
-    SettingsView.swift         endpoint / Authorization 头 / 大导出阈值
+    JSONPreviewView.swift      预览 sheet：摘要卡 + 截断片段 + 文件 ShareLink + 发送
+    SettingsView.swift         endpoint / Authorization 头 / 大导出阈值 / UUID 开关
 ExporterTests/ExporterTests.swift   JSONExporter 单测（Swift Testing）
 ```
 
 **分层职责**：Health（读取）→ Model（归一化数据）→ Export（编码/发送）→ Store（持久化）→ UI（展示/协调）。
 
-## 4. JSON Schema
+## 4. JSON Schema（v2）
 
-`ExportEnvelope` 编码（`JSONExporter`：`.iso8601` 时间、`.prettyPrinted`、`.sortedKeys`、`.withoutEscapingSlashes`）：
+`ExportDocument` 经 `JSONExporter`（自定义字符串序列化器，非 JSONEncoder）输出。设计目标：消除 v1 逐条对象的键名/uuid/双时间戳冗余，对 LLM 与人都好读 —— 顶层美化缩进、**每条样本 row 单行**：
 
 ```json
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "exportedAt": "ISO8601",
   "device": { "model": "iPhone", "os": "iOS 26.5" },
   "range": { "mode": "incremental|range", "start": "ISO8601?", "end": "ISO8601?" },
-  "samples": [
-    {
-      "type": "stepCount", "category": "activity",
-      "value": 1234, "unit": "count",          // quantity 样本
-      "start": "ISO8601", "end": "ISO8601",
-      "source": "Apple Watch", "uuid": "…"
+  "sources": ["Apple Watch", "iPhone"],
+  "metrics": {
+    "heartRate": {
+      "category": "vitals",
+      "unit": "count/min",
+      "count": 9800,
+      "columns": ["start", "durationSec", "value", "source"],
+      "rows": [
+        ["2026-06-09T08:00:00Z", 0, 72, 0],
+        ["2026-06-09T08:00:05Z", 0, 73.5, 0]
+      ]
     },
-    {
-      "type": "sleepAnalysis", "category": "sleep",
-      "stringValue": "asleepCore",              // category 样本（无 value/unit）
-      "start": "ISO8601", "end": "ISO8601", "source": "iPhone", "uuid": "…"
+    "sleepAnalysis": {
+      "category": "sleep",
+      "count": 120,
+      "columns": ["start", "durationSec", "value", "source"],
+      "rows": [
+        ["2026-06-09T23:10:00Z", 6600, "asleepCore", 1]
+      ]
     }
-  ]
+  }
 }
 ```
 
-- `HealthSample`：quantity 填 `value`+`unit`；category 填 `stringValue`。synthesized Codable 用 `encodeIfPresent`，nil 字段自动省略（单测有断言）。
-- 睡眠 `stringValue` 映射 `HKCategoryValueSleepAnalysis`：`inBed/asleepUnspecified/awake/asleepCore/asleepDeep/asleepREM`。
-- `uuid` = `HKObject.uuid`，用于去重。
+- 按指标分组：`type`/`category`/`unit` 提升到组级；`unit` 仅 quantity 组有（省略约定沿用：可选项缺省不写、全文无 null，单测锁定）。
+- 时间 = `start`（ISO8601）+ `durationSec`（整数秒）；瞬时样本（如心率）时长为 0。
+- `source` 列是顶层 `sources` 数组的下标（来源名去重）。
+- quantity 的 `value` 是数字（整数值不带 `.0`），category 的是字符串（睡眠映射 `HKCategoryValueSleepAnalysis`：`inBed/asleepUnspecified/awake/asleepCore/asleepDeep/asleepREM`）。
+- 设置「样本包含 UUID」开启时，`columns` 追加 `"uuid"`、每行末尾追加 HK UUID（接收端精确去重用；默认关，文件可省约 1/3 体积）。
+- metrics 按 `HealthMetric.registered` 顺序、组内按 start 升序，输出确定性。
+- v1（schemaVersion 1，逐条 `samples` 对象数组）已在 commit `4f2372f` 之后废弃，无线上接收端兼容包袱。
 
 ## 5. 已实现功能
 
@@ -100,6 +113,13 @@ ExporterTests/ExporterTests.swift   JSONExporter 单测（Swift Testing）
 4. **轻量探测显示状态**：授权后/进入时并行跑 limit=1 查询（`probeLatest`），保守标注每个指标「最近 X」/「无数据或未授权」。
 5. **增量显示上次同步**：`AppSettings.lastSyncDate` 持久化，增量模式显示「上次同步：X」/「尚未同步过（将导出全部历史）」。
 6. **大导出确认弹层**：导出跨度 > 阈值（`largeExportThresholdDays`，默认 3 天，设置里可配）时，弹自定义弹层（非系统 alert，因 alert 文案弹出后不可更新）：先显示「估算中…」，后台查询返回后异步填入「约 N 条样本」；按钮 **继续全部 / 仅最近 N 天 / 取消**。
+
+### 导出提速 + Schema v2（本轮）
+1. **Schema v2 紧凑格式**（见 §4）：`ExportDocument` 按指标分组 + columns/rows 单行紧凑行 + 来源索引表 + start/durationSec 时间编码；UUID 改为设置开关（默认关）。高频数据下文件体积约缩至 v1 的 1/4。
+2. **自定义序列化器**：`JSONExporter` 弃用 JSONEncoder（`.prettyPrinted` 会把 row 数组每元素炸成一行，Codable 路径也慢），改为直接字符串构建（共享 `ISO8601DateFormatter`、`reserveCapacity`、整数值不带 `.0`）。
+3. **预览不再卡死**：根因是 `JSONPreviewView` 用单个 `Text` 渲染整个多 MB JSON 字符串，SwiftUI 超长 Text 布局在主线程。现改为：后台序列化 → 写临时文件（`tmp/HealthExport-<时间戳>.json`，写前删上一份）→ 截取前 64KB（按行边界）作预览片段；主线程只持有轻量摘要状态（文件 URL、字节数、各指标条数、数据范围），不再常驻 `samples`/`jsonString` 两份大数据。
+4. **分享/发送走文件**：`ShareLink(item: fileURL)` 分享 `.json` 文件（替代大字符串分享）；发送 API 时从文件后台读 `Data`。
+5. **预览 UI**：摘要卡（GroupBox：文件大小/数据范围/各指标条数）+ 截断片段 + 「预览已截断」提示。
 
 ## 6. 关键技术决策与理由
 
@@ -155,6 +175,7 @@ xcrun simctl io booted screenshot /tmp/shot.png
 
 - `84af50d` — Exporter MVP：HealthKit → JSON 导出（第一版 UI）。
 - `4f2372f` — 体验与性能改进：异步导出、并行查询、授权/状态可见性、大导出确认、anchor 延迟提交。
+- `3db83a4` — schema v2 紧凑格式 + 文件落盘预览：导出提速、预览不再卡死（feat/json-export-v2 分支）。
 
 ## 13. 坑 / 注意
 

@@ -32,10 +32,11 @@ struct SettingsView: View {
                     Stepper(value: $settings.largeExportThresholdDays, in: 1...30) {
                         Text("大导出确认阈值：\(settings.largeExportThresholdDays) 天")
                     }
+                    Toggle("样本包含 UUID", isOn: $settings.includeUUID)
                 } header: {
                     Text("导出")
                 } footer: {
-                    Text("导出数据跨度超过该天数时，会先弹出确认，可选择继续全部或仅最近 \(settings.largeExportThresholdDays) 天。")
+                    Text("导出数据跨度超过该天数时，会先弹出确认，可选择继续全部或仅最近 \(settings.largeExportThresholdDays) 天。UUID 用于接收端精确去重，会显著增大文件。")
                 }
             }
             .navigationTitle("设置")

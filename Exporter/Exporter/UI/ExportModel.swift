@@ -16,8 +16,16 @@ final class ExportModel {
     let settings: AppSettings
     let health: HealthKitManager
 
-    var samples: [HealthSample] = []
-    var jsonString: String = ""
+    // 导出产物（大数据落盘，仅轻量摘要驻留内存，避免巨型字符串卡渲染）
+    var exportFileURL: URL?
+    var exportByteCount = 0
+    var previewSnippet = ""
+    var previewTruncated = false
+    var sampleCount = 0
+    var metricCounts: [MetricCount] = []
+    var dataStart: Date?
+    var dataEnd: Date?
+
     var isWorking = false
     var statusMessage: String?
     var errorMessage: String?
@@ -42,6 +50,17 @@ final class ExportModel {
         let spanText: String
         var estimatedCount: Int?
         let recentDays: Int
+    }
+
+    /// 预览摘要里展示的单指标条数。后台任务中构造，需脱离 MainActor 隔离。
+    nonisolated struct MetricCount: Identifiable, Sendable {
+        let type: String
+        let count: Int
+        var id: String { type }
+
+        var displayName: String {
+            HealthMetric(rawValue: type)?.displayName ?? type
+        }
     }
 
     init() {
@@ -238,27 +257,103 @@ final class ExportModel {
         }
     }
 
-    /// 提交 anchor（仅全量增量）、编码 JSON、打开预览。
+    /// 提交 anchor（仅全量增量）、序列化并落盘 JSON、打开预览。
     private func finishExport(outcome: HealthKitManager.FetchOutcome, isFullIncremental: Bool) async {
         if isFullIncremental {
             health.commit(outcome)
             settings.lastSyncDate = Date()
         }
-        samples = outcome.samples
+        let device = ExportDocument.DeviceInfo(
+            model: UIDevice.current.model,
+            os: "\(UIDevice.current.systemName) \(UIDevice.current.systemVersion)"
+        )
+        let range = ExportDocument.ExportRange(
+            mode: settings.mode,
+            start: settings.mode == .range ? settings.rangeStart : nil,
+            end: settings.mode == .range ? settings.rangeEnd : nil
+        )
         do {
-            jsonString = try await Self.encodeJSON(makeEnvelope(samples: outcome.samples))
-            statusMessage = "读取到 \(outcome.samples.count) 条样本。"
+            let artifact = try await Self.produceArtifact(samples: outcome.samples,
+                                                          device: device,
+                                                          range: range,
+                                                          includeUUID: settings.includeUUID,
+                                                          replacing: exportFileURL)
+            exportFileURL = artifact.fileURL
+            exportByteCount = artifact.byteCount
+            previewSnippet = artifact.snippet
+            previewTruncated = artifact.truncated
+            sampleCount = artifact.sampleCount
+            metricCounts = artifact.metricCounts
+            dataStart = artifact.dataStart
+            dataEnd = artifact.dataEnd
+            statusMessage = "读取到 \(artifact.sampleCount) 条样本。"
             showPreview = true
         } catch {
             errorMessage = error.localizedDescription
         }
     }
 
-    /// 在后台线程编码，避免阻塞主线程。
-    nonisolated private static func encodeJSON(_ envelope: ExportEnvelope) async throws -> String {
+    /// 后台产物：JSON 文件 + 截断预览 + 摘要。主线程只接收这份轻量结构。
+    nonisolated private struct ExportArtifact: Sendable {
+        let fileURL: URL
+        let byteCount: Int
+        let snippet: String
+        let truncated: Bool
+        let sampleCount: Int
+        let metricCounts: [MetricCount]
+        let dataStart: Date?
+        let dataEnd: Date?
+    }
+
+    /// 预览片段最大字节数；之外的内容只进文件，避免超长 Text 卡死主线程布局。
+    private static let previewByteLimit = 64 * 1024
+
+    /// 在后台线程序列化、写临时文件并裁出预览片段，避免阻塞主线程。
+    nonisolated private static func produceArtifact(samples: [HealthSample],
+                                                    device: ExportDocument.DeviceInfo,
+                                                    range: ExportDocument.ExportRange,
+                                                    includeUUID: Bool,
+                                                    replacing previousURL: URL?) async throws -> ExportArtifact {
         try await Task.detached(priority: .userInitiated) {
-            try JSONExporter.string(envelope)
+            let document = ExportDocument(samples: samples, device: device,
+                                          range: range, includeUUID: includeUUID)
+            let data = JSONExporter.encode(document)
+
+            if let previousURL {
+                try? FileManager.default.removeItem(at: previousURL)
+            }
+            let stamp = Date().formatted(.iso8601.year().month().day()
+                .timeSeparator(.omitted).dateSeparator(.omitted).time(includingFractionalSeconds: false))
+            let fileURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("HealthExport-\(stamp).json")
+            try data.write(to: fileURL, options: .atomic)
+
+            let (snippet, truncated) = Self.makeSnippet(from: data)
+            var counts: [(String, Int)] = []
+            for group in document.groups {
+                counts.append((group.type, group.rows.count))
+            }
+            return ExportArtifact(fileURL: fileURL,
+                                  byteCount: data.count,
+                                  snippet: snippet,
+                                  truncated: truncated,
+                                  sampleCount: samples.count,
+                                  metricCounts: counts.map { MetricCount(type: $0.0, count: $0.1) },
+                                  dataStart: samples.first?.start,
+                                  dataEnd: samples.last?.end)
         }.value
+    }
+
+    /// 取 JSON 开头若干 KB 作预览，按行边界截断，保证 UTF-8 合法。
+    nonisolated private static func makeSnippet(from data: Data) -> (String, Bool) {
+        guard data.count > previewByteLimit else {
+            return (String(decoding: data, as: UTF8.self), false)
+        }
+        var head = data.prefix(previewByteLimit)
+        if let lastNewline = head.lastIndex(of: UInt8(ascii: "\n")) {
+            head = head[..<lastNewline]
+        }
+        return (String(decoding: head, as: UTF8.self), true)
     }
 
     // MARK: 发送
@@ -268,7 +363,7 @@ final class ExportModel {
             errorMessage = "未配置 API endpoint，可在设置中填写，或使用分享导出。"
             return
         }
-        guard !jsonString.isEmpty else {
+        guard let fileURL = exportFileURL else {
             errorMessage = "没有可发送的数据，请先读取。"
             return
         }
@@ -278,24 +373,13 @@ final class ExportModel {
         do {
             let sender = HTTPSender(endpoint: settings.endpoint,
                                     authorizationHeader: settings.authorizationHeader)
-            let data = Data(jsonString.utf8)
+            let data = try await Task.detached(priority: .userInitiated) {
+                try Data(contentsOf: fileURL)
+            }.value
             try await sender.send(data)
-            statusMessage = "已发送 \(samples.count) 条样本。"
+            statusMessage = "已发送 \(sampleCount) 条样本。"
         } catch {
             errorMessage = error.localizedDescription
         }
-    }
-
-    private func makeEnvelope(samples: [HealthSample]) -> ExportEnvelope {
-        let device = ExportEnvelope.DeviceInfo(
-            model: UIDevice.current.model,
-            os: "\(UIDevice.current.systemName) \(UIDevice.current.systemVersion)"
-        )
-        let range = ExportEnvelope.ExportRange(
-            mode: settings.mode,
-            start: settings.mode == .range ? settings.rangeStart : nil,
-            end: settings.mode == .range ? settings.rangeEnd : nil
-        )
-        return ExportEnvelope(device: device, range: range, samples: samples)
     }
 }
