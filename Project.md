@@ -182,6 +182,7 @@ ExporterTests/ExporterTests.swift   JSONExporter 单测（Swift Testing）
 - macOS/visionOS 未支持（target 仅 iOS）。
 - **ECG 仅导出摘要**（分类/平均心率/采样率/电压点数），不含逐点波形（每条 ~15000 点，体积失衡）。
 - **用药**：仅导出剂量事件；`concept` 为标识符字符串（药物名需 `HKUserAnnotatedMedicationQuery`，留后续）；授权经由「按药物逐对象授权」面板。
+- **授权是三段式**：健康数据（标准面板）→ 用药（逐对象）→ 验光处方（逐对象），三个系统面板依次弹出且无法合并；App 在发起前用 alert 预告流程。
 - **不导出**：训练 GPS 路线（HKSeriesType）、活动圆环摘要（三环已含于 quantity）、临床记录（需特殊 entitlement + FHIR）。
 
 ## 10. 路线图（候选，未做）
