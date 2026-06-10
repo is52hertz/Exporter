@@ -44,7 +44,7 @@ nonisolated struct AnchorStore {
     }
 
     func resetAll() {
-        HealthMetric.allCases.forEach(reset)
+        HealthMetric.registered.forEach(reset)
     }
 }
 #endif

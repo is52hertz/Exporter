@@ -2,25 +2,27 @@
 //  ExportDocument.swift
 //  Exporter
 //
-//  Schema v2 导出文档：按指标分组，columns/rows 紧凑行，来源去重为索引表。
+//  Schema v3 导出文档：按指标分组，columns/rows 紧凑行，来源去重为索引表，
+//  顶层可选 profile（个人特征）；特殊类型经 extraColumns 携带附加列。
 //  由 [HealthSample] + 元信息构建，经 JSONExporter 序列化。
 //
 
 import Foundation
 
-/// 导出负载顶层结构（schema v2）。
-/// 相比 v1 的逐条对象：type/category/unit 提升到组级、source 用索引表去重、
-/// 时间编码为 start + 时长秒，大幅缩短文件并更利于 LLM 解析。
+/// 导出负载顶层结构（schema v3）。
+/// v2 → v3：新增顶层 profile；组 columns 支持按指标追加附加列（体能训练/心境/心电图等）。
 nonisolated struct ExportDocument: Sendable {
     let schemaVersion: Int
     let exportedAt: Date
     let device: DeviceInfo
     let range: ExportRange
+    /// 个人特征（出生日期/性别/血型等）；无任何已授权项时为 nil（省略）。
+    let profile: ExportProfile?
     /// 去重后的数据来源名；row 中的 source 列是该数组的下标。
     let sources: [String]
     let groups: [MetricGroup]
 
-    static let currentSchemaVersion = 2
+    static let currentSchemaVersion = 3
 
     struct DeviceInfo: Sendable {
         let model: String   // 如 "iPhone"
@@ -33,26 +35,30 @@ nonisolated struct ExportDocument: Sendable {
         let end: Date?
     }
 
-    /// 一个指标的全部样本。unit 仅 quantity 指标有；category 指标省略。
+    /// 一个指标的全部样本。unit 仅 quantity 指标有；category/特殊指标省略。
     struct MetricGroup: Sendable {
-        let type: String        // HealthMetric.rawValue，如 "heartRate"
+        let type: String        // HealthMetric.rawValue，如 "heartRate" / "workout"
         let category: String
         let unit: String?
+        /// 基础列之外的附加列名（特殊类型），与每行 extra 的值一一对应。
+        let extraColumns: [String]
         let rows: [Row]
     }
 
-    /// 单条样本的紧凑行。列序固定：start, durationSec, value, source[, uuid]。
+    /// 单条样本的紧凑行。列序固定：start, durationSec, value, source[, …extra][, uuid]。
     struct Row: Sendable {
         let start: Date
         let durationSec: Int
         let value: Value
         let sourceIndex: Int
+        /// 特殊类型的附加列值；与组的 extraColumns 对齐（缺测处为 .null）。
+        let extra: [JSONValue]
         /// 仅当用户开启「包含 UUID」时携带。
         let uuid: String?
 
         enum Value: Sendable {
-            case number(Double)   // quantity 样本
-            case string(String)   // category 样本，如 "asleepCore"
+            case number(Double)   // quantity 样本及特殊类型主数值
+            case string(String)   // category 样本及特殊类型主字符串
         }
     }
 
@@ -62,11 +68,13 @@ nonisolated struct ExportDocument: Sendable {
          device: DeviceInfo,
          range: ExportRange,
          includeUUID: Bool,
+         profile: ExportProfile? = nil,
          exportedAt: Date = Date()) {
         self.schemaVersion = Self.currentSchemaVersion
         self.exportedAt = exportedAt
         self.device = device
         self.range = range
+        self.profile = (profile?.isEmpty == false) ? profile : nil
 
         var sourceIndices: [String: Int] = [:]
         var sources: [String] = []
@@ -95,6 +103,7 @@ nonisolated struct ExportDocument: Sendable {
                           durationSec: Int(sample.end.timeIntervalSince(sample.start).rounded()),
                           value: value,
                           sourceIndex: sourceIndex,
+                          extra: sample.extra ?? [],
                           uuid: includeUUID ? sample.uuid : nil)
             rowsByType[sample.type, default: []].append(row)
             categoryByType[sample.type] = sample.category
@@ -109,6 +118,7 @@ nonisolated struct ExportDocument: Sendable {
             MetricGroup(type: type,
                         category: categoryByType[type] ?? "unknown",
                         unit: unitByType[type] ?? nil,
+                        extraColumns: HealthMetric.byRawValue[type]?.extraColumns ?? [],
                         rows: rowsByType[type] ?? [])
         }
     }
