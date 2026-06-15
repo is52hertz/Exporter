@@ -167,6 +167,7 @@ ExporterTests/ExporterTests.swift   JSONExporter 单测（Swift Testing）
 - **target**：`SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"`（app target，已从默认的含 macosx/xros 收窄；因 macOS 无 HealthKit）。
 - **Info / 权限**：`GENERATE_INFOPLIST_FILE = YES`（无独立 Info.plist）；`INFOPLIST_KEY_NSHealthShareUsageDescription` 注入用途字符串；`CODE_SIGN_ENTITLEMENTS = Exporter/Exporter.entitlements`（含 `com.apple.developer.healthkit`）。
 - **签名**：`DEVELOPMENT_TEAM = 29QGYWRLCD`，automatic。模拟器构建无需 provisioning。
+- **App 图标**：Icon Composer **`.icon`** 包（iOS 26 Liquid Glass，矢量层 + 渐变，非 PNG 切图），放在同步文件夹内 `Exporter/Exporter/AppIcon.icon`，随同步组自动入 target；`ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon` 直接指向它，构建时 actool 自动渲染各尺寸 PNG 回退。**默认空的 `AppIcon.appiconset` 已删除**（与 `AppIcon.icon` 同名会歧义；下一个 agent 别再去 `Assets.xcassets` 找图标集）。
 
 ## 8. UI / HIG 决策
 
