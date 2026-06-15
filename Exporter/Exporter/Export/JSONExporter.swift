@@ -2,7 +2,7 @@
 //  JSONExporter.swift
 //  Exporter
 //
-//  将 ExportDocument 序列化为稳定、可读的 JSON（schema v2）。
+//  将 ExportDocument 序列化为稳定、可读的 JSON（schema v3）。
 //  自定义字符串构建而非 JSONEncoder：顶层美化缩进、每条样本 row 单行、
 //  整数值不带小数点 —— 比 Codable + .prettyPrinted 快得多，排版也可控。
 //
@@ -20,13 +20,17 @@ nonisolated enum JSONExporter {
     static func string(_ document: ExportDocument) -> String {
         let rowCount = document.groups.reduce(0) { $0 + $1.rows.count }
         var out = String()
-        out.reserveCapacity(rowCount * 56 + 1024)
+        out.reserveCapacity(rowCount * 56 + 2048)
 
         out += "{\n"
         out += "  \"schemaVersion\": \(document.schemaVersion),\n"
         out += "  \"exportedAt\": \(quoted(date: document.exportedAt)),\n"
         out += "  \"device\": { \"model\": \(quoted(document.device.model)), \"os\": \(quoted(document.device.os)) },\n"
         out += "  \"range\": \(rangeObject(document.range)),\n"
+        if let profile = document.profile {
+            let fields = profile.fields.map { "\(quoted($0.key)): \(quoted($0.value))" }
+            out += "  \"profile\": { \(fields.joined(separator: ", ")) },\n"
+        }
         out += "  \"sources\": [\(document.sources.map(quoted).joined(separator: ", "))],\n"
         out += "  \"metrics\": {"
 
@@ -47,7 +51,7 @@ nonisolated enum JSONExporter {
 
     private static func append(_ group: ExportDocument.MetricGroup, to out: inout String) {
         let includesUUID = group.rows.contains { $0.uuid != nil }
-        var columns = ["start", "durationSec", "value", "source"]
+        var columns = ["start", "durationSec", "value", "source"] + group.extraColumns
         if includesUUID { columns.append("uuid") }
 
         out += "    \(quoted(group.type)): {\n"
@@ -68,6 +72,10 @@ nonisolated enum JSONExporter {
             case .string(let string): out += quoted(string)
             }
             out += ", \(row.sourceIndex)"
+            for value in row.extra {
+                out += ", "
+                append(value, to: &out)
+            }
             if includesUUID {
                 out += ", \(quoted(row.uuid ?? ""))"
             }
@@ -75,6 +83,25 @@ nonisolated enum JSONExporter {
         }
         out += group.rows.isEmpty ? "]\n" : "\n      ]\n"
         out += "    }"
+    }
+
+    /// 递归序列化附加列值（嵌套数组保持单行紧凑）。
+    private static func append(_ value: JSONValue, to out: inout String) {
+        switch value {
+        case .number(let number):
+            out += numberString(number)
+        case .string(let string):
+            out += quoted(string)
+        case .array(let items):
+            out += "["
+            for (index, item) in items.enumerated() {
+                if index > 0 { out += ", " }
+                append(item, to: &out)
+            }
+            out += "]"
+        case .null:
+            out += "null"
+        }
     }
 
     private static func rangeObject(_ range: ExportDocument.ExportRange) -> String {

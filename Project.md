@@ -19,7 +19,7 @@
 
 - **平台**：MVP 仅 iPhone (iOS 26)。Watch / iPad / 后台自动 / 快捷指令留后续。app target 已收窄为 iOS-only（macOS 无 HealthKit）。
 - **同步触发**：手动点击（后台自动留后续）。
-- **数据点（MVP）**：步数 `stepCount`、活动能量 `activeEnergyBurned`、心率 `heartRate`、睡眠分析 `sleepAnalysis`——覆盖 累计 quantity / 离散 quantity / category 三种形态。新增指标只需在 `HealthMetric` 加 case + 补映射。
+- **数据点（全量）**：覆盖 iOS 26.5 SDK 全部可读类型 —— 120 quantity + 69 category + 8 特殊类型（体能训练 / 心境 / 心电图 / 听力图 / GAD-7 / PHQ-9 / 视力处方 / 用药记录）+ 6 项个人特征（profile）。目录数据驱动（`HealthMetric.registered`，由 SDK 头文件机械生成，官方中文名），新增指标只需在注册表加一行。
 - **时间范围**：两种模式——**增量**（`HKAnchoredObjectQuery` anchor 持久化）与**指定日期段**。
 - **JSON schema**：自设计（见 §4）。
 - **API 认证**：尚未定 → 发送层做成可插拔协议，现支持「填 endpoint + 可选 Authorization 头 POST」或「本机预览/分享」，认证方式定了再补具体实现。
@@ -35,11 +35,13 @@ Exporter/Exporter/
   ContentView.swift            主界面（授权/模式/指标/导出/确认弹层）
   Exporter.entitlements        com.apple.developer.healthkit
   Health/
-    HealthMetric.swift         数据类型表：HealthMetric / HealthCategory（纯描述符，nonisolated）
-    HealthKitManager.swift     授权 + 查询 + 探测 + HK 映射扩展（@MainActor 类，查询方法 nonisolated）
+    HealthMetric.swift         全量数据类型目录：197 项（120q+69c+8特殊）+ HealthCategory 14 分类（纯描述符，nonisolated）
+    HealthKitManager.swift     授权（标准+逐对象）+ 查询（并发窗口 12）+ 按 kind 分派转换 + 全部值名称表 + profile 读取
   Model/
-    HealthSample.swift         归一化中间模型（nonisolated Codable Sendable）
-    ExportDocument.swift       schema v2 顶层文档：按指标分组 + columns/rows + 来源索引表
+    HealthSample.swift         归一化中间模型（nonisolated Sendable，extra 携带特殊类型附加列）
+    JSONValue.swift            附加列递归值类型（number/string/array/null）
+    ExportProfile.swift        个人特征（出生日期/性别/血型/肤型/轮椅/活动模式）
+    ExportDocument.swift       schema v3 顶层文档：分组 + columns/rows + extraColumns + profile + 来源索引表
     SyncMode.swift             同步模式枚举（增量 / 日期段）
   Export/
     JSONExporter.swift         自定义字符串序列化器（nonisolated，row 单行紧凑排版）
@@ -48,7 +50,7 @@ Exporter/Exporter/
     AnchorStore.swift          增量 anchor 持久化（nonisolated struct，UserDefaults）
     AppSettings.swift          @MainActor @Observable 用户配置
   UI/
-    ExportModel.swift          @MainActor @Observable，UI 状态/流程单一来源
+    ExportModel.swift          @MainActor @Observable，UI 状态/流程单一来源（懒探测缓存）
     JSONPreviewView.swift      预览 sheet：摘要卡 + 截断片段 + 文件 ShareLink + 发送
     SettingsView.swift         endpoint / Authorization 头 / 大导出阈值 / UUID 开关
 ExporterTests/ExporterTests.swift   JSONExporter 单测（Swift Testing）
@@ -56,20 +58,21 @@ ExporterTests/ExporterTests.swift   JSONExporter 单测（Swift Testing）
 
 **分层职责**：Health（读取）→ Model（归一化数据）→ Export（编码/发送）→ Store（持久化）→ UI（展示/协调）。
 
-## 4. JSON Schema（v2）
+## 4. JSON Schema（v3）
 
-`ExportDocument` 经 `JSONExporter`（自定义字符串序列化器，非 JSONEncoder）输出。设计目标：消除 v1 逐条对象的键名/uuid/双时间戳冗余，对 LLM 与人都好读 —— 顶层美化缩进、**每条样本 row 单行**：
+`ExportDocument` 经 `JSONExporter`（自定义字符串序列化器，非 JSONEncoder）输出。设计目标：消除逐条对象的键名/uuid/双时间戳冗余，对 LLM 与人都好读 —— 顶层美化缩进、**每条样本 row 单行**：
 
 ```json
 {
-  "schemaVersion": 2,
+  "schemaVersion": 3,
   "exportedAt": "ISO8601",
   "device": { "model": "iPhone", "os": "iOS 26.5" },
   "range": { "mode": "incremental|range", "start": "ISO8601?", "end": "ISO8601?" },
+  "profile": { "dateOfBirth": "1990-01-31", "biologicalSex": "male", "bloodType": "oPositive" },
   "sources": ["Apple Watch", "iPhone"],
   "metrics": {
     "heartRate": {
-      "category": "vitals",
+      "category": "heart",
       "unit": "count/min",
       "count": 9800,
       "columns": ["start", "durationSec", "value", "source"],
@@ -78,25 +81,43 @@ ExporterTests/ExporterTests.swift   JSONExporter 单测（Swift Testing）
         ["2026-06-09T08:00:05Z", 0, 73.5, 0]
       ]
     },
-    "sleepAnalysis": {
-      "category": "sleep",
-      "count": 120,
-      "columns": ["start", "durationSec", "value", "source"],
+    "workout": {
+      "category": "workout",
+      "count": 12,
+      "columns": ["start", "durationSec", "value", "source", "kcal", "distanceKm"],
       "rows": [
-        ["2026-06-09T23:10:00Z", 6600, "asleepCore", 1]
+        ["2026-06-09T18:00:00Z", 1800, "running", 0, 320, 5.2]
+      ]
+    },
+    "stateOfMind": {
+      "category": "mindfulness",
+      "count": 3,
+      "columns": ["start", "durationSec", "value", "source", "kind", "classification", "labels", "associations"],
+      "rows": [
+        ["2026-06-09T21:00:00Z", 0, 0.5, 1, "momentaryEmotion", "pleasant", ["happy", "calm"], ["fitness"]]
       ]
     }
   }
 }
 ```
 
-- 按指标分组：`type`/`category`/`unit` 提升到组级；`unit` 仅 quantity 组有（省略约定沿用：可选项缺省不写、全文无 null，单测锁定）。
+- 按指标分组：`type`/`category`/`unit` 提升到组级；`unit` 仅 quantity 组有。
 - 时间 = `start`（ISO8601）+ `durationSec`（整数秒）；瞬时样本（如心率）时长为 0。
 - `source` 列是顶层 `sources` 数组的下标（来源名去重）。
-- quantity 的 `value` 是数字（整数值不带 `.0`），category 的是字符串（睡眠映射 `HKCategoryValueSleepAnalysis`：`inBed/asleepUnspecified/awake/asleepCore/asleepDeep/asleepREM`）。
-- 设置「样本包含 UUID」开启时，`columns` 追加 `"uuid"`、每行末尾追加 HK UUID（接收端精确去重用；默认关，文件可省约 1/3 体积）。
-- metrics 按 `HealthMetric.registered` 顺序、组内按 start 升序，输出确定性。
-- v1（schemaVersion 1，逐条 `samples` 对象数组）已在 commit `4f2372f` 之后废弃，无线上接收端兼容包袱。
+- quantity 的 `value` 是数字（整数值不带 `.0`），category 的是字符串（值名称表见 `HealthKitManager.categoryValueName`：睡眠阶段、症状 severity、经期枚举等；事件型 `notApplicable` → `"occurred"`）。
+- **特殊类型附加列**（`HealthMetric.extraColumns`，主值 = value 列）：
+  - `workout`：value=运动类型（英文驼峰，`workoutActivityName` 全表），+`kcal`/`distanceKm`
+  - `stateOfMind`：value=愉悦度 (-1…1)，+`kind`/`classification`/`labels`/`associations`（嵌套字符串数组）
+  - `electrocardiogram`：value=分类结果，+`avgBPM`/`samplingHz`/`voltagePoints`（仅摘要，不含逐点波形）
+  - `audiogram`：value=测试点数，+`points` = `[[频率Hz, 左耳dBHL?, 右耳dBHL?], …]`
+  - `GAD7`/`PHQ9`：value=得分，+`risk`
+  - `visionPrescription`：value=glasses/contacts，+`issued`/`expires`
+  - `medicationDoseEvent`：value=记录状态（taken/skipped/…），+`concept`/`dose`/`doseUnit`
+- 省略约定：对象可选键缺省不写；row 单元格仅在附加列缺测时为 `null`（定宽行）。
+- `profile`：个人特征（characteristics），无任何已授权项时整体省略。
+- 设置「样本包含 UUID」开启时，`columns` 末尾追加 `"uuid"`（接收端精确去重用；默认关）。
+- metrics 按 `HealthMetric.registered` 顺序、组内按 start 升序，输出确定性，单测锁定。
+- 历史：v1（逐条对象数组）→ v2（分组紧凑行，commit `3db83a4`）→ v3（全量目录 + profile + extraColumns）。无线上接收端兼容包袱。
 
 ## 5. 已实现功能
 
@@ -121,6 +142,15 @@ ExporterTests/ExporterTests.swift   JSONExporter 单测（Swift Testing）
 4. **分享/发送走文件**：`ShareLink(item: fileURL)` 分享 `.json` 文件（替代大字符串分享）；发送 API 时从文件后台读 `Data`。
 5. **预览 UI**：摘要卡（GroupBox：文件大小/数据范围/各指标条数）+ 截断片段 + 「预览已截断」提示。
 
+### 全量健康&健身目录（本轮，schema v3）
+1. **HealthMetric 重构**：枚举 → 数据驱动 struct 目录，197 项（120 quantity + 69 category + 8 特殊），由 SDK 头文件 `HKTypeIdentifiers.h` 机械生成（单位取头文件注释），官方中文名；`HealthCategory` 扩为健康 App 同款 14 分类。旧四指标 rawValue 不变，anchor/设置持久化兼容。
+2. **HK 映射**：标识符 = `rawValue` 首字母大写 + 特例表（`VO2Max`/`UVExposure`/`AudioExposureEvent` 历史更名）；单位 = 显式 `HKUnit` 字典（25 种，不用 `HKUnit(from:)` 解析）。两者均有全量单测。
+3. **转换按 kind 分派**：quantity/category 通用路径 + 7 种特殊样本类型专属转换（见 §4 附加列）；category 值名称表覆盖睡眠/症状/经期/事件等全部已知枚举。
+4. **授权**：标准读集合 + characteristics 一并请求；**逐对象授权类型（视力处方/用药）绝不能进标准授权 API**（见 §13）。
+5. **并发窗口**：fetch 同时最多 12 个 HK 查询（近 200 类型不再无界并发）。
+6. **UI**：指标区改为 14 分类 `DisclosureGroup`（默认收起）+ 组全选 + 顶部全选/全不选 + 已选计数；探测改为懒加载（展开分类才查询该组，结果缓存，启动零查询）。
+7. **Profile**：导出时后台读取个人特征，写入顶层 `profile`。
+
 ## 6. 关键技术决策与理由
 
 - **并发隔离**：工程全局默认 MainActor。只把「纯数据 + 查询 + 编码 + 网络」标 `nonisolated`/`Sendable` 移出主线程；UI 状态类（`ExportModel`/`AppSettings`/`HealthKitManager` 的可观察状态）保持 `@MainActor`。`@MainActor` class 隐式 `Sendable`，可在任务组捕获 `self`。`HealthKitManager` 的 `healthStore`/`anchorStore` 用 `nonisolated let`（二者 Sendable/线程安全）以便后台查询方法访问。目标：编译零警告（Swift 5 模式下隔离冲突仅警告）。
@@ -137,6 +167,7 @@ ExporterTests/ExporterTests.swift   JSONExporter 单测（Swift Testing）
 - **target**：`SUPPORTED_PLATFORMS = "iphoneos iphonesimulator"`（app target，已从默认的含 macosx/xros 收窄；因 macOS 无 HealthKit）。
 - **Info / 权限**：`GENERATE_INFOPLIST_FILE = YES`（无独立 Info.plist）；`INFOPLIST_KEY_NSHealthShareUsageDescription` 注入用途字符串；`CODE_SIGN_ENTITLEMENTS = Exporter/Exporter.entitlements`（含 `com.apple.developer.healthkit`）。
 - **签名**：`DEVELOPMENT_TEAM = 29QGYWRLCD`，automatic。模拟器构建无需 provisioning。
+- **App 图标**：Icon Composer **`.icon`** 包（iOS 26 Liquid Glass，矢量层 + 渐变，非 PNG 切图），放在同步文件夹内 `Exporter/Exporter/AppIcon.icon`，随同步组自动入 target；`ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon` 直接指向它，构建时 actool 自动渲染各尺寸 PNG 回退。**默认空的 `AppIcon.appiconset` 已删除**（与 `AppIcon.icon` 同名会歧义；下一个 agent 别再去 `Assets.xcassets` 找图标集）。
 
 ## 8. UI / HIG 决策
 
@@ -150,6 +181,10 @@ ExporterTests/ExporterTests.swift   JSONExporter 单测（Swift Testing）
 - 探测无法区分「未授权」与「无数据」（见 §6）。
 - 模拟器 HealthKit 数据极少，且 `simctl` 无法模拟点按 → 确认弹层、真实读取、性能需**真机**验证。
 - macOS/visionOS 未支持（target 仅 iOS）。
+- **ECG 仅导出摘要**（分类/平均心率/采样率/电压点数），不含逐点波形（每条 ~15000 点，体积失衡）。
+- **用药**：仅导出剂量事件；`concept` 为标识符字符串（药物名需 `HKUserAnnotatedMedicationQuery`，留后续）；授权经由「按药物逐对象授权」面板。
+- **授权是三段式**：健康数据（标准面板）→ 用药（逐对象）→ 验光处方（逐对象），三个系统面板依次弹出且无法合并；App 在发起前用 alert 预告流程。
+- **不导出**：训练 GPS 路线（HKSeriesType）、活动圆环摘要（三环已含于 quantity）、临床记录（需特殊 entitlement + FHIR）。
 
 ## 10. 路线图（候选，未做）
 
@@ -176,10 +211,14 @@ xcrun simctl io booted screenshot /tmp/shot.png
 - `84af50d` — Exporter MVP：HealthKit → JSON 导出（第一版 UI）。
 - `4f2372f` — 体验与性能改进：异步导出、并行查询、授权/状态可见性、大导出确认、anchor 延迟提交。
 - `3db83a4` — schema v2 紧凑格式 + 文件落盘预览：导出提速、预览不再卡死（feat/json-export-v2 分支）。
+- `db05de4` — 全量健康&健身数据目录（197 项）+ schema v3：数据驱动目录、特殊类型、逐对象授权修复、分类折叠 UI（feat/full-health-catalog 分支）。
 
 ## 13. 坑 / 注意
 
 - **SourceKit 跨文件索引滞后**：在 Xcode 之外用工具新增/改文件后，编辑器常报「Cannot find type X in scope」误报，但 `xcodebuild` 干净通过。处理：`⌘B` 重新编译 / `⇧⌘K` 清理 / 重开工程。**以 `xcodebuild` 结果为准，别被实时报错带偏。**
+- **逐对象授权类型会炸标准授权 API**：把 `visionPrescriptionType` / `medicationDoseEventType` 放进 `requestAuthorization` 或 `getRequestStatusForAuthorization` 的读集合 → HealthKit 抛 `NSInvalidArgumentException`（启动即崩，曾踩）。必须走 `requestPerObjectReadAuthorization`（用药目标是 `userAnnotatedMedicationType`），并对这两类的查询失败做容错。`requiresPerObjectAuthorization()` 对 dose event 类型返回 false，不能只靠它过滤 —— 需按 kind 显式排除。
+- **历史更名标识符**：`environmentalAudioExposureEvent` 的原始字符串仍是 `HKCategoryTypeIdentifierAudioExposureEvent`；机械拼接标识符时需特例表（另有 `VO2Max`/`UVExposure` 大小写）。单测 `everyMetricResolvesToSampleType` 全量守护。
+- **部分类型授权面板不展示（真机踩坑）**：地区/设备功能限制下个别类型（如问卷评估、房颤负荷等）不会出现在授权面板，用户无法授予 → 该类型永远 `notDetermined`：① `getRequestStatusForAuthorization` 对全集永远返回 `shouldRequest`（授权按钮状态需用 `settings.hasRequestedAuthorization` 持久化兜底）；② 查询抛 `errorAuthorizationNotDetermined`（fetch 必须按指标跳过并上报 `skippedMetrics`，不能让单指标炸掉整体导出）。真机现象：授予全部权限后导出仍弹 "Authorization not determined"、按钮不变「管理」。
 - 同步文件夹下别手动往 pbxproj 加源文件引用（会重复）。
 - `AGENTS.md`（及其符号链接 `CLAUDE.md`）曾是从别的仓库复制来的，已重写为本项目约定。
 - 提交前确认 `xcuserdata/` 未被纳入（已 gitignore）。

@@ -11,6 +11,7 @@ import SwiftUI
 struct ContentView: View {
     @State private var model = ExportModel()
     @State private var showSettings = false
+    @State private var expandedCategories: Set<HealthCategory> = []
 
     var body: some View {
         NavigationStack {
@@ -32,7 +33,6 @@ struct ContentView: View {
             }
             .task {
                 await model.refreshAuthorizationState()
-                await model.refreshProbes()
             }
             .sheet(isPresented: $showSettings) {
                 SettingsView(settings: model.settings)
@@ -68,13 +68,21 @@ struct ContentView: View {
     private var authSection: some View {
         Section {
             Button {
-                Task { await model.handleAuthorizationTap() }
+                model.handleAuthorizationTap()
             } label: {
                 Label(model.authorizationDetermined ? "健康权限已设置（点此管理）" : "请求健康数据授权",
                       systemImage: "heart.text.square")
             }
         } footer: {
             Text("仅读取你授权的数据。HealthKit 不会告知 App 你“拒绝”了哪些项；下方各指标显示的是探测到的最近数据。")
+        }
+        .alert("将弹出 3 个授权面板", isPresented: $model.showAuthFlowNotice) {
+            Button("开始授权") {
+                Task { await model.proceedAuthorization() }
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("系统会依次弹出 3 个授权请求：① 健康与健身数据（项目较多，可用顶部“全部打开”）；② 用药记录（按药物授权）；③ 验光处方。请逐一确认。")
         }
     }
 
@@ -103,20 +111,53 @@ struct ContentView: View {
     }
 
     private var metricsSection: some View {
-        Section("数据指标") {
-            ForEach(HealthMetric.registered) { metric in
-                Toggle(isOn: binding(for: metric)) {
-                    Label {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(metric.displayName)
-                            Text(subtitle(for: metric))
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+        Section {
+            ForEach(HealthCategory.allCases) { category in
+                DisclosureGroup(isExpanded: expansionBinding(for: category)) {
+                    ForEach(metrics(in: category)) { metric in
+                        Toggle(isOn: binding(for: metric)) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(metric.displayName)
+                                Text(subtitle(for: metric))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
                         }
-                    } icon: {
-                        Image(systemName: metric.systemImage)
                     }
+                } label: {
+                    categoryRow(category)
                 }
+            }
+        } header: {
+            HStack {
+                Text("数据指标")
+                Spacer()
+                Button(allSelected ? "全不选" : "全选") {
+                    setAll(selected: !allSelected)
+                }
+                .font(.footnote)
+            }
+        } footer: {
+            Text("已选 \(model.settings.selectedMetrics.count) / \(HealthMetric.registered.count) 项。展开分类可查看各指标的最近数据。")
+        }
+    }
+
+    /// 分类行：图标 + 名称 + 已选计数 + 组全选开关。
+    private func categoryRow(_ category: HealthCategory) -> some View {
+        let metrics = metrics(in: category)
+        let selectedCount = metrics.count { model.settings.selectedMetrics.contains($0) }
+        return Toggle(isOn: categoryBinding(for: category)) {
+            Label {
+                HStack {
+                    Text(category.displayName)
+                    Spacer()
+                    Text("\(selectedCount)/\(metrics.count)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+            } icon: {
+                Image(systemName: category.systemImage)
             }
         }
     }
@@ -199,6 +240,45 @@ struct ContentView: View {
 
     // MARK: Helpers
 
+    private func metrics(in category: HealthCategory) -> [HealthMetric] {
+        HealthMetric.registered.filter { $0.category == category }
+    }
+
+    private var allSelected: Bool {
+        model.settings.selectedMetrics.count == HealthMetric.registered.count
+    }
+
+    private func setAll(selected: Bool) {
+        model.settings.selectedMetrics = selected ? Set(HealthMetric.registered) : []
+    }
+
+    /// 展开状态绑定：首次展开时触发该分类的懒探测。
+    private func expansionBinding(for category: HealthCategory) -> Binding<Bool> {
+        Binding(
+            get: { expandedCategories.contains(category) },
+            set: { expanded in
+                if expanded {
+                    expandedCategories.insert(category)
+                    Task { await model.probeCategory(category) }
+                } else {
+                    expandedCategories.remove(category)
+                }
+            }
+        )
+    }
+
+    /// 组全选绑定：开 = 全选该分类，关 = 清空该分类。
+    private func categoryBinding(for category: HealthCategory) -> Binding<Bool> {
+        let metrics = metrics(in: category)
+        return Binding(
+            get: { metrics.allSatisfy { model.settings.selectedMetrics.contains($0) } },
+            set: { isOn in
+                if isOn { model.settings.selectedMetrics.formUnion(metrics) }
+                else { model.settings.selectedMetrics.subtract(metrics) }
+            }
+        )
+    }
+
     private func binding(for metric: HealthMetric) -> Binding<Bool> {
         Binding(
             get: { model.settings.selectedMetrics.contains(metric) },
@@ -210,12 +290,11 @@ struct ContentView: View {
     }
 
     private func subtitle(for metric: HealthMetric) -> String {
-        let base = metric.category.displayName
-        guard model.hasProbed else { return base }
+        guard model.probedCategories.contains(metric.category) else { return "探测中…" }
         if let date = model.probeDates[metric] {
-            return base + " · 最近 " + date.formatted(.relative(presentation: .named))
+            return "最近 " + date.formatted(.relative(presentation: .named))
         } else {
-            return base + " · 无数据或未授权"
+            return "无数据或未授权"
         }
     }
 

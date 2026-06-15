@@ -34,10 +34,13 @@ final class ExportModel {
     // 授权
     var authorizationDetermined = false
     var showAuthSettingsAlert = false
+    /// 请求前的多面板流程说明（健康数据 + 用药 + 验光处方共三个系统面板依次弹出）。
+    var showAuthFlowNotice = false
 
-    // 各指标最近样本时间（保守探测：有=已授权且有数据；无=未授权或无数据）
+    // 各指标最近样本时间（保守探测：有=已授权且有数据；无=未授权或无数据）。
+    // 懒探测：展开某分类时才查询该组，结果缓存；probedCategories 记录已探测的分类。
     var probeDates: [HealthMetric: Date] = [:]
-    var hasProbed = false
+    var probedCategories: Set<HealthCategory> = []
 
     // 大导出确认弹层（非 nil 即显示）
     var confirm: LargeExportConfirm?
@@ -82,24 +85,36 @@ final class ExportModel {
     // MARK: 授权
 
     func refreshAuthorizationState() async {
-        authorizationDetermined = await health.isAuthorizationDetermined(for: HealthMetric.registered)
+        // 部分类型不出现在授权面板（地区/设备功能限制），系统状态会永远停在 shouldRequest；
+        // 已成功请求过一次即视为已决（再请求面板也不会出现这些类型）。
+        if settings.hasRequestedAuthorization {
+            authorizationDetermined = true
+        } else {
+            authorizationDetermined = await health.isAuthorizationDetermined(for: HealthMetric.registered)
+        }
     }
 
-    /// 未决 → 弹系统授权面板；已决 → 弹说明（引导去设置）。
-    func handleAuthorizationTap() async {
+    /// 未决 → 先弹流程说明（授权分三个系统面板）；已决 → 弹说明（引导去设置）。
+    func handleAuthorizationTap() {
         if authorizationDetermined {
             showAuthSettingsAlert = true
-            return
+        } else {
+            showAuthFlowNotice = true
         }
+    }
+
+    /// 用户确认流程说明后实际发起授权（依次弹出健康数据 / 用药 / 验光处方面板）。
+    func proceedAuthorization() async {
         errorMessage = nil
         do {
             try await health.requestAuthorization(for: HealthMetric.registered)
-            statusMessage = "已发起授权请求。"
+            settings.hasRequestedAuthorization = true
+            statusMessage = "授权流程已完成。"
         } catch {
             errorMessage = error.localizedDescription
         }
         await refreshAuthorizationState()
-        await refreshProbes()
+        await reprobeKnownCategories()
     }
 
     func openSystemSettings() {
@@ -108,10 +123,13 @@ final class ExportModel {
         }
     }
 
-    // MARK: 探测
+    // MARK: 探测（懒加载：按分类）
 
-    func refreshProbes() async {
-        let metrics = HealthMetric.registered
+    /// 探测一个分类下所有指标的最近样本时间；已探测过的分类直接命中缓存。
+    func probeCategory(_ category: HealthCategory) async {
+        guard !probedCategories.contains(category) else { return }
+        probedCategories.insert(category)
+        let metrics = HealthMetric.registered.filter { $0.category == category }
         let results = await withTaskGroup(of: (HealthMetric, Date?).self) { group -> [(HealthMetric, Date?)] in
             for metric in metrics {
                 group.addTask { (metric, await self.health.probeLatest(metric)) }
@@ -120,10 +138,17 @@ final class ExportModel {
             for await pair in group { acc.append(pair) }
             return acc
         }
-        var dict: [HealthMetric: Date] = [:]
-        for (metric, date) in results where date != nil { dict[metric] = date }
-        probeDates = dict
-        hasProbed = true
+        for (metric, date) in results where date != nil { probeDates[metric] = date }
+    }
+
+    /// 授权状态变化后重新探测已展开过的分类（清缓存重查）。
+    func reprobeKnownCategories() async {
+        let known = probedCategories
+        probedCategories = []
+        probeDates = [:]
+        for category in known {
+            await probeCategory(category)
+        }
     }
 
     // MARK: 导出入口
@@ -273,10 +298,13 @@ final class ExportModel {
             end: settings.mode == .range ? settings.rangeEnd : nil
         )
         do {
+            let health = self.health
+            let profile = await Task.detached(priority: .userInitiated) { health.readProfile() }.value
             let artifact = try await Self.produceArtifact(samples: outcome.samples,
                                                           device: device,
                                                           range: range,
                                                           includeUUID: settings.includeUUID,
+                                                          profile: profile,
                                                           replacing: exportFileURL)
             exportFileURL = artifact.fileURL
             exportByteCount = artifact.byteCount
@@ -286,7 +314,13 @@ final class ExportModel {
             metricCounts = artifact.metricCounts
             dataStart = artifact.dataStart
             dataEnd = artifact.dataEnd
-            statusMessage = "读取到 \(artifact.sampleCount) 条样本。"
+            var message = "读取到 \(artifact.sampleCount) 条样本。"
+            if !outcome.skippedMetrics.isEmpty {
+                let names = outcome.skippedMetrics.prefix(3).map(\.displayName).joined(separator: "、")
+                let suffix = outcome.skippedMetrics.count > 3 ? " 等" : ""
+                message += "跳过 \(outcome.skippedMetrics.count) 项未授权指标（\(names)\(suffix)）。"
+            }
+            statusMessage = message
             showPreview = true
         } catch {
             errorMessage = error.localizedDescription
@@ -306,17 +340,19 @@ final class ExportModel {
     }
 
     /// 预览片段最大字节数；之外的内容只进文件，避免超长 Text 卡死主线程布局。
-    private static let previewByteLimit = 64 * 1024
+    nonisolated private static let previewByteLimit = 64 * 1024
 
     /// 在后台线程序列化、写临时文件并裁出预览片段，避免阻塞主线程。
     nonisolated private static func produceArtifact(samples: [HealthSample],
                                                     device: ExportDocument.DeviceInfo,
                                                     range: ExportDocument.ExportRange,
                                                     includeUUID: Bool,
+                                                    profile: ExportProfile?,
                                                     replacing previousURL: URL?) async throws -> ExportArtifact {
         try await Task.detached(priority: .userInitiated) {
             let document = ExportDocument(samples: samples, device: device,
-                                          range: range, includeUUID: includeUUID)
+                                          range: range, includeUUID: includeUUID,
+                                          profile: profile)
             let data = JSONExporter.encode(document)
 
             if let previousURL {
