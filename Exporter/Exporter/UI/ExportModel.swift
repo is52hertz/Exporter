@@ -154,6 +154,11 @@ final class ExportModel {
     // MARK: 导出入口
 
     func startExport() {
+        // 重入守护：估算进行中（确认弹层在显示）或导出执行中时拒绝再次进入。
+        // 估算期间 isWorking 仍为 false，必须靠 confirm 非空拦住，否则再次 startExport
+        // 会取消并重启同一估算、清空 pendingOutcome（R1）。估算失败/取消后 confirm 归
+        // nil，可正常重新开始。
+        guard !isWorking, confirm == nil else { return }
         guard canRead else {
             errorMessage = "请至少选择一个指标。"
             return
@@ -230,10 +235,12 @@ final class ExportModel {
     /// 继续导出全部：复用确认阶段已取的样本，不重复查询。
     func confirmContinueAll() {
         guard let outcome = pendingOutcome else { return }   // 估算未完成时按钮应禁用
+        // 连点守护：同步置 isWorking，同一 runloop 内的第二次点击直接被拦下。
+        guard !isWorking else { return }
+        isWorking = true
         confirm = nil
         pendingOutcome = nil
         Task {
-            isWorking = true
             defer { isWorking = false }
             await finishExport(outcome: outcome, isFullIncremental: outcome.isIncremental)
         }
@@ -241,6 +248,9 @@ final class ExportModel {
 
     /// 仅导出最近 N 天：取消进行中的全量查询，改跑局部 range 读取（不动 anchor / lastSyncDate）。
     func confirmRecentOnly() {
+        // 连点守护：同步置 isWorking，同一 runloop 内的第二次点击直接被拦下。
+        guard !isWorking else { return }
+        isWorking = true
         let days = settings.largeExportThresholdDays
         let metrics = selectedMetricsInOrder
         confirm = nil
@@ -249,7 +259,6 @@ final class ExportModel {
         let end = Date()
         let start = end.addingTimeInterval(-Double(days) * 86_400)
         Task {
-            isWorking = true
             defer { isWorking = false }
             do {
                 let outcome = try await health.fetch(metrics: metrics, mode: .range, start: start, end: end)
@@ -269,9 +278,11 @@ final class ExportModel {
     // MARK: 执行
 
     private func runExport(mode: SyncMode, start: Date?, end: Date?, isFullIncremental: Bool) {
+        // 连点守护：同步置 isWorking（原来在 Task 体内，同一 runloop 内连点会双启动）。
+        guard !isWorking else { return }
+        isWorking = true
         let metrics = selectedMetricsInOrder
         Task {
-            isWorking = true
             defer { isWorking = false }
             do {
                 let outcome = try await health.fetch(metrics: metrics, mode: mode, start: start, end: end)
@@ -282,12 +293,10 @@ final class ExportModel {
         }
     }
 
-    /// 提交 anchor（仅全量增量）、序列化并落盘 JSON、打开预览。
+    /// 序列化并落盘 JSON、打开预览；文件成功落盘后才提交 anchor（仅全量增量）。
+    /// 顺序不可颠倒：写盘失败（磁盘满 / 编码错误 / 临时目录被清）时绝不能推进同步位置，
+    /// 否则这些样本下次增量会被永久跳过 —— 这正是 anchor 延迟提交设计要防的失败模式。
     private func finishExport(outcome: HealthKitManager.FetchOutcome, isFullIncremental: Bool) async {
-        if isFullIncremental {
-            health.commit(outcome)
-            settings.lastSyncDate = Date()
-        }
         let device = ExportDocument.DeviceInfo(
             model: UIDevice.current.model,
             os: "\(UIDevice.current.systemName) \(UIDevice.current.systemVersion)"
@@ -306,6 +315,11 @@ final class ExportModel {
                                                           includeUUID: settings.includeUUID,
                                                           profile: profile,
                                                           replacing: exportFileURL)
+            // 写盘成功，此刻才提交 anchor / lastSyncDate（仅全量增量）。
+            if isFullIncremental {
+                health.commit(outcome)
+                settings.lastSyncDate = Date()
+            }
             exportFileURL = artifact.fileURL
             exportByteCount = artifact.byteCount
             previewSnippet = artifact.snippet
