@@ -72,6 +72,28 @@ struct CatalogTests {
         }
     }
 
+    @Test func perObjectAuthTypesExcludedFromStandardReadSet() throws {
+        // 守门测试：视力处方 / 用药剂量事件绝对不允许进入标准授权读集合。
+        // 放进 requestAuthorization 或 getRequestStatusForAuthorization 的读集合
+        // 会让 HealthKit 抛 NSException（启动即崩，Project.md §13 记录在案）。
+        let standardTypes = HealthKitManager.standardReadTypes(for: HealthMetric.registered)
+        // 两个类型构造器在本 SDK 返回非可选，直接赋值（避免冗余 #require 警告）。
+        let vision = HKObjectType.visionPrescriptionType()
+        let medication = HKObjectType.medicationDoseEventType()
+        #expect(!standardTypes.contains(vision), "视力处方不得进入标准授权读集合")
+        #expect(!standardTypes.contains(medication), "用药剂量事件不得进入标准授权读集合")
+
+        // 判定函数本身必须精准：两类逐对象类型命中，普通类型不错判。
+        let visionMetric = try #require(HealthMetric(rawValue: "visionPrescription"))
+        let medicationMetric = try #require(HealthMetric(rawValue: "medicationDoseEvent"))
+        #expect(HealthKitManager.isPerObjectAuthorized(visionMetric))
+        #expect(HealthKitManager.isPerObjectAuthorized(medicationMetric))
+        for raw in ["stepCount", "heartRate", "sleepAnalysis"] {
+            let metric = try #require(HealthMetric(rawValue: raw))
+            #expect(!HealthKitManager.isPerObjectAuthorized(metric))
+        }
+    }
+
     @Test func workoutActivityNames() throws {
         #expect(HealthKitManager.workoutActivityName(.running) == "running")
         #expect(HealthKitManager.workoutActivityName(.traditionalStrengthTraining) == "traditionalStrengthTraining")
@@ -234,5 +256,88 @@ struct ExporterTests {
         #expect(document.sources == ["Apple Watch", "iPhone"])
         // 组按 HealthMetric.registered 顺序输出（activity → heart → sleep）
         #expect(document.groups.map(\.type) == ["stepCount", "heartRate", "sleepAnalysis"])
+    }
+}
+
+// MARK: - 稳健性（加载夹紧 / 导出入口重入）
+
+/// 隔离 UserDefaults suite 的辅助：每个用例独立 suite，结束即清理，不污染真实设置。
+@MainActor
+private func makeIsolatedSettings(storedThreshold: Int?) -> AppSettings {
+    let name = "test.exporter.robustness.\(UUID().uuidString)"
+    let suite = UserDefaults(suiteName: name)!   // 测试专用 suite，名字合法必非 nil
+    suite.removePersistentDomain(forName: name)  // 先清一次，保证从空白开始
+    defer { suite.removePersistentDomain(forName: name) }
+    if let storedThreshold {
+        suite.set(storedThreshold, forKey: "settings.thresholdDays")
+    }
+    return AppSettings(defaults: suite)
+}
+
+@MainActor
+struct RobustnessTests {
+
+    /// R2：加载端夹紧到与设置界面一致的 1...30。
+    @Test func thresholdClampedToUIRangeOnLoad() {
+        // 缺值 → 默认 3
+        #expect(makeIsolatedSettings(storedThreshold: nil).largeExportThresholdDays == 3)
+        // 越界下限：0 / 负数 / Int.min → 夹到 1
+        #expect(makeIsolatedSettings(storedThreshold: 0).largeExportThresholdDays == 1)
+        #expect(makeIsolatedSettings(storedThreshold: -5).largeExportThresholdDays == 1)
+        #expect(makeIsolatedSettings(storedThreshold: Int.min).largeExportThresholdDays == 1)
+        // 越界上限：31 / 365 / Int.max → 夹到 30（界面 Stepper 上限）
+        #expect(makeIsolatedSettings(storedThreshold: 31).largeExportThresholdDays == 30)
+        #expect(makeIsolatedSettings(storedThreshold: 365).largeExportThresholdDays == 30)
+        #expect(makeIsolatedSettings(storedThreshold: Int.max).largeExportThresholdDays == 30)
+        // 合法值原样保留
+        #expect(makeIsolatedSettings(storedThreshold: 1).largeExportThresholdDays == 1)
+        #expect(makeIsolatedSettings(storedThreshold: 3).largeExportThresholdDays == 3)
+        #expect(makeIsolatedSettings(storedThreshold: 30).largeExportThresholdDays == 30)
+    }
+
+    /// R1（条件一）：导出执行中（isWorking）再次 startExport 必须被拒绝。
+    /// 可观测断言：估算弹层从未出现（若未被拦截，全历史路径会同步进入 presentConfirm）。
+    @Test func startExportRejectedWhileExportRunning() {
+        let settings = makeIsolatedSettings(storedThreshold: nil)
+        let model = ExportModel(settings: settings, health: HealthKitManager())
+        #expect(model.canRead)   // 默认全选，保证走全历史 → presentConfirm 路径
+        model.isWorking = true
+        model.startExport()
+        #expect(model.confirm == nil, "isWorking 时 startExport 不应进入估算流程")
+    }
+
+    /// R1（条件二）：估算进行中（确认弹层在显示）再次 startExport 必须被拒绝，
+    /// 不得取消并重启估算。用带标记的快照检测是否被 presentConfirm 覆盖。
+    @Test func startExportRejectedWhileEstimating() {
+        let settings = makeIsolatedSettings(storedThreshold: nil)
+        let model = ExportModel(settings: settings, health: HealthKitManager())
+        #expect(model.canRead)
+        // 伪造估算中的弹层快照：字段值与 presentConfirm 会产生的真实值不同，
+        // 若重入发生会被覆盖为真实 spanText / recentDays=3。
+        model.confirm = ExportModel.LargeExportConfirm(
+            spanText: "估算快照标记", estimatedCount: nil, recentDays: 30)
+        model.startExport()
+        #expect(model.confirm?.spanText == "估算快照标记", "估算中再次 startExport 不应重启估算")
+        #expect(model.confirm?.recentDays == 30)
+    }
+
+    /// R1（恢复路径）：取消估算后可重新开始（confirm 归 nil 后守护不再拦截）。
+    @Test func startExportAllowedAgainAfterCancel() {
+        let settings = makeIsolatedSettings(storedThreshold: nil)
+        let model = ExportModel(settings: settings, health: HealthKitManager())
+        #expect(model.canRead)
+        model.confirm = ExportModel.LargeExportConfirm(
+            spanText: "估算快照标记", estimatedCount: nil, recentDays: 30)
+        model.confirmCancel()
+        #expect(model.confirm == nil)
+        model.isWorking = false
+        // 缩小指标集到两项：真正走一次 presentConfirm 的估算路径时，
+        // 避免在测试环境里对全量 197 项发起真 HealthKit 查询。
+        model.settings.selectedMetrics = Set(["stepCount", "heartRate"].compactMap(HealthMetric.init(rawValue:)))
+        // 取消后再点：应能重新进入估算流程（同步置入新弹层）。
+        model.startExport()
+        #expect(model.confirm != nil, "取消估算后应允许重新开始")
+        #expect(model.confirm?.spanText != "估算快照标记")
+        model.confirmCancel()   // 清理，避免测试遗留进行中的估算任务
     }
 }
