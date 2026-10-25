@@ -341,3 +341,58 @@ struct RobustnessTests {
         model.confirmCancel()   // 清理，避免测试遗留进行中的估算任务
     }
 }
+
+// MARK: - 小修一批：https / 设置快照 / 唯一临时文件
+
+@MainActor
+struct SmallFixTests {
+    @Test func senderAcceptsOnlyHTTPSWithHost() {
+        #expect(HTTPSender.validatedURL("https://example.com/api") != nil)
+        #expect(HTTPSender.validatedURL("HTTPS://example.com") != nil)
+        #expect(HTTPSender.validatedURL("http://example.com") == nil)
+        #expect(HTTPSender.validatedURL("ftp://example.com") == nil)
+        #expect(HTTPSender.validatedURL("https://") == nil)
+        #expect(HTTPSender.validatedURL("example.com") == nil)
+        #expect(HTTPSender.validatedURL("javascript:alert(1)") == nil)
+    }
+
+    @Test func senderRejectsHTTPBeforeNetwork() async {
+        let sender = HTTPSender(endpoint: "http://example.com/x", authorizationHeader: "Bearer t")
+        do {
+            try await sender.send(Data())
+            Issue.record("http endpoint 应被拒绝")
+        } catch let e as SenderError {
+            guard case .insecureScheme = e else { Issue.record("错误类型不对：\(e)"); return }
+        } catch { Issue.record("意外错误：\(error)") }
+    }
+
+    @Test func confirmSnapshotIsolatedFromLaterSettingChanges() {
+        let settings = makeIsolatedSettings(storedThreshold: nil)
+        let model = ExportModel(settings: settings, health: HealthKitManager())
+        #expect(model.canRead)
+        settings.mode = .incremental
+        settings.lastSyncDate = nil          // 触发全部历史 → 弹层
+        model.startExport()
+        let snap = model.confirmSnapshot
+        #expect(snap != nil)
+        #expect(snap?.mode == .incremental)
+        settings.mode = .range
+        settings.includeUUID.toggle()
+        #expect(model.confirmSnapshot == snap, "估算期间改设置不应改变快照")
+        model.confirmCancel()
+        #expect(model.confirmSnapshot == nil)
+    }
+
+    @Test func artifactFileNamesUniqueAndOldFileRemovedAfterWrite() async throws {
+        let device = ExportDocument.DeviceInfo(model: "t", os: "t")
+        let range = ExportDocument.ExportRange(mode: .incremental, start: nil, end: nil)
+        let a = try await ExportModel.produceArtifact(samples: [], device: device, range: range,
+                                                      includeUUID: false, profile: nil, replacing: nil)
+        let b = try await ExportModel.produceArtifact(samples: [], device: device, range: range,
+                                                      includeUUID: false, profile: nil, replacing: a.fileURL)
+        #expect(a.fileURL != b.fileURL, "同一秒连续导出不应撞名")
+        #expect(!FileManager.default.fileExists(atPath: a.fileURL.path), "新文件写成功后应删旧文件")
+        #expect(FileManager.default.fileExists(atPath: b.fileURL.path))
+        try? FileManager.default.removeItem(at: b.fileURL)
+    }
+}
