@@ -37,11 +37,11 @@ nonisolated struct HTTPSender: ExportSender {
     let endpoint: String
     let authorizationHeader: String?
     /// 默认会话使用拒绝一切重定向的代理，只向用户配置的单一地址发送。
-    var session: URLSession = HTTPSender.makeSecureSession()
+    var session: URLSession = HTTPSender.secureSession
 
-    static func makeSecureSession() -> URLSession {
-        URLSession(configuration: .ephemeral, delegate: NoRedirectDelegate(), delegateQueue: nil)
-    }
+    /// 全进程共用一个拒绝重定向的会话：不会每次发送都新建会话而不回收。
+    static let secureSession = URLSession(configuration: .ephemeral,
+                                          delegate: NoRedirectDelegate(), delegateQueue: nil)
 
     /// 只接受带主机名的 https 地址；其余（http、无主机、其他协议）一律拒绝。
     static func validatedURL(_ s: String) -> URL? {
