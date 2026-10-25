@@ -377,10 +377,26 @@ struct SmallFixTests {
         #expect(r.includeUUID)
     }
 
-    @Test func redirectDelegateAllowsOnlyHTTPS() {
-        #expect(HTTPSOnlyRedirectDelegate.allows(URL(string: "https://a.example/x")))
-        #expect(!HTTPSOnlyRedirectDelegate.allows(URL(string: "http://a.example/x")))
-        #expect(!HTTPSOnlyRedirectDelegate.allows(nil))
+    @Test func redirectsNeverFollowed() {
+        #expect(!NoRedirectDelegate.shouldFollow(to: URL(string: "https://other.example/x")))
+        #expect(!NoRedirectDelegate.shouldFollow(to: URL(string: "http://a.example/x")))
+        #expect(!NoRedirectDelegate.shouldFollow(to: nil))
+    }
+
+    /// 跨主机（https→另一个 https）与降级（https→http）重定向：回调必须收到 nil，即不发出后续请求。
+    @Test func crossHostRedirectCallbackGetsNil() {
+        let delegate = NoRedirectDelegate()
+        let session = URLSession(configuration: .ephemeral)
+        let task = session.dataTask(with: URL(string: "https://a.example/hook")!)
+        for target in ["https://b.example/steal", "http://a.example/hook"] {
+            let resp = HTTPURLResponse(url: URL(string: "https://a.example/hook")!, statusCode: 307,
+                                       httpVersion: nil, headerFields: ["Location": target])!
+            var followed: URLRequest? = URLRequest(url: URL(string: "https://sentinel.example")!)
+            delegate.urlSession(session, task: task, willPerformHTTPRedirection: resp,
+                                newRequest: URLRequest(url: URL(string: target)!)) { followed = $0 }
+            #expect(followed == nil, "重定向到 \(target) 不应被跟随")
+        }
+        session.invalidateAndCancel()
     }
 
     @Test func confirmSnapshotIsolatedFromLaterSettingChanges() {
