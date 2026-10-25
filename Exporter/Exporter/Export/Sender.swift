@@ -36,7 +36,12 @@ nonisolated enum SenderError: LocalizedError {
 nonisolated struct HTTPSender: ExportSender {
     let endpoint: String
     let authorizationHeader: String?
-    var session: URLSession = .shared
+    /// 默认会话使用只放行 https 重定向的代理，防止 https 地址 30x 跳到 http 后带着凭据明文发出。
+    var session: URLSession = HTTPSender.makeSecureSession()
+
+    static func makeSecureSession() -> URLSession {
+        URLSession(configuration: .ephemeral, delegate: HTTPSOnlyRedirectDelegate(), delegateQueue: nil)
+    }
 
     /// 只接受带主机名的 https 地址；其余（http、无主机、其他协议）一律拒绝。
     static func validatedURL(_ s: String) -> URL? {
@@ -69,5 +74,19 @@ nonisolated struct HTTPSender: ExportSender {
             let body = String(data: respData, encoding: .utf8)
             throw SenderError.httpStatus(http.statusCode, body: body)
         }
+    }
+}
+
+/// 重定向目标不是 https 时拒绝跟随（返回 nil 即把 30x 响应原样交回，随后按非 2xx 报错）。
+nonisolated final class HTTPSOnlyRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    static func allows(_ url: URL?) -> Bool {
+        url?.scheme?.lowercased() == "https"
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest,
+                    completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(Self.allows(request.url) ? request : nil)
     }
 }

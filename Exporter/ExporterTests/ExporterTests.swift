@@ -366,6 +366,23 @@ struct SmallFixTests {
         } catch { Issue.record("意外错误：\(error)") }
     }
 
+    @Test func recentOnlySnapshotLabelsRangeMatchingQuery() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let orig = ExportModel.ExportSnapshot(mode: .incremental, rangeStart: .distantPast,
+                                              rangeEnd: .distantPast, includeUUID: true, thresholdDays: 7)
+        let r = ExportModel.recentSnapshot(from: orig, now: now)
+        #expect(r.mode == .range)
+        #expect(r.rangeEnd == now)
+        #expect(r.rangeStart == now.addingTimeInterval(-7 * 86_400))
+        #expect(r.includeUUID)
+    }
+
+    @Test func redirectDelegateAllowsOnlyHTTPS() {
+        #expect(HTTPSOnlyRedirectDelegate.allows(URL(string: "https://a.example/x")))
+        #expect(!HTTPSOnlyRedirectDelegate.allows(URL(string: "http://a.example/x")))
+        #expect(!HTTPSOnlyRedirectDelegate.allows(nil))
+    }
+
     @Test func confirmSnapshotIsolatedFromLaterSettingChanges() {
         let settings = makeIsolatedSettings(storedThreshold: nil)
         let model = ExportModel(settings: settings, health: HealthKitManager())

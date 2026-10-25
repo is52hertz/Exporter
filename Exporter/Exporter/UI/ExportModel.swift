@@ -165,6 +165,13 @@ final class ExportModel {
 
     private(set) var confirmSnapshot: ExportSnapshot?
 
+    /// 「仅最近 N 天」的快照：模式改为 range、起止为最近 N 天，文件里标注的范围与实际查询一致。
+    static func recentSnapshot(from snap: ExportSnapshot, now: Date) -> ExportSnapshot {
+        ExportSnapshot(mode: .range,
+                       rangeStart: now.addingTimeInterval(-Double(snap.thresholdDays) * 86_400),
+                       rangeEnd: now, includeUUID: snap.includeUUID, thresholdDays: snap.thresholdDays)
+    }
+
     private func makeSnapshot() -> ExportSnapshot {
         ExportSnapshot(mode: settings.mode, rangeStart: settings.rangeStart,
                        rangeEnd: settings.rangeEnd, includeUUID: settings.includeUUID,
@@ -274,19 +281,19 @@ final class ExportModel {
         guard !isWorking else { return }
         isWorking = true
         let snap = confirmSnapshot ?? makeSnapshot()
-        let days = snap.thresholdDays
         let metrics = selectedMetricsInOrder
         confirm = nil
         confirmSnapshot = nil
         fetchTask?.cancel()
         pendingOutcome = nil
-        let end = Date()
-        let start = end.addingTimeInterval(-Double(days) * 86_400)
+        let recentSnap = Self.recentSnapshot(from: snap, now: Date())
+        let start = recentSnap.rangeStart
+        let end = recentSnap.rangeEnd
         Task {
             defer { isWorking = false }
             do {
                 let outcome = try await health.fetch(metrics: metrics, mode: .range, start: start, end: end)
-                await finishExport(outcome: outcome, isFullIncremental: false, snapshot: snap)
+                await finishExport(outcome: outcome, isFullIncremental: false, snapshot: recentSnap)
             } catch {
                 errorMessage = error.localizedDescription
             }
