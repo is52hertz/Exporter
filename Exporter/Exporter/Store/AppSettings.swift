@@ -23,6 +23,10 @@ final class AppSettings {
         didSet { defaults.set(authorizationHeader, forKey: Keys.authHeader) }
     }
 
+    var backgroundPushEnabled: Bool {
+        didSet { defaults.set(backgroundPushEnabled, forKey: Keys.backgroundPushEnabled) }
+    }
+
     /// 当前选中的指标集合。
     var selectedMetrics: Set<HealthMetric> {
         didSet {
@@ -66,6 +70,7 @@ final class AppSettings {
         self.defaults = defaults
         self.endpoint = defaults.string(forKey: Keys.endpoint) ?? ""
         self.authorizationHeader = defaults.string(forKey: Keys.authHeader) ?? ""
+        self.backgroundPushEnabled = defaults.bool(forKey: Keys.backgroundPushEnabled)
 
         if let raw = defaults.array(forKey: Keys.selectedMetrics) as? [String] {
             self.selectedMetrics = Set(raw.compactMap(HealthMetric.init(rawValue:)))
@@ -87,6 +92,7 @@ final class AppSettings {
     private enum Keys {
         static let endpoint = "settings.endpoint"
         static let authHeader = "settings.authHeader"
+        static let backgroundPushEnabled = "settings.backgroundPushEnabled"
         static let selectedMetrics = "settings.selectedMetrics"
         static let lastSyncDate = "settings.lastSyncDate"
         static let thresholdDays = "settings.thresholdDays"

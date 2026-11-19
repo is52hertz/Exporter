@@ -11,12 +11,14 @@ import HealthKit
 
 nonisolated struct AnchorStore {
     private let defaults: UserDefaults
+    private let keyPrefix: String
 
-    init(defaults: UserDefaults = .standard) {
+    init(defaults: UserDefaults = .standard, keyPrefix: String = "anchor") {
         self.defaults = defaults
+        self.keyPrefix = keyPrefix
     }
 
-    private func key(for metric: HealthMetric) -> String { "anchor.\(metric.rawValue)" }
+    private func key(for metric: HealthMetric) -> String { "\(keyPrefix).\(metric.rawValue)" }
 
     func anchor(for metric: HealthMetric) -> HKQueryAnchor? {
         guard let data = defaults.data(forKey: key(for: metric)) else { return nil }

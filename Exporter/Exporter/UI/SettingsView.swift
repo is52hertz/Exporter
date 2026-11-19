@@ -29,6 +29,13 @@ struct SettingsView: View {
                 }
 
                 Section {
+                    Toggle("后台增量推送", isOn: $settings.backgroundPushEnabled)
+                        .disabled(!settings.hasEndpoint && !settings.backgroundPushEnabled)
+                } footer: {
+                    Text("开启后，健康数据更新时会将所选且已授权的常规样本自动发送到上方 API。首次推送可能包含历史数据；未配置地址时不会推送。推送时机由系统决定。")
+                }
+
+                Section {
                     Stepper(value: $settings.largeExportThresholdDays, in: 1...30) {
                         Text("大导出确认阈值：\(settings.largeExportThresholdDays) 天")
                     }

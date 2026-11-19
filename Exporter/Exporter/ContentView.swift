@@ -9,7 +9,7 @@
 import SwiftUI
 
 struct ContentView: View {
-    @State private var model = ExportModel()
+    @Bindable var model: ExportModel
     @State private var showSettings = false
     @State private var expandedCategories: Set<HealthCategory> = []
 
@@ -327,5 +327,5 @@ struct ContentView: View {
 }
 
 #Preview {
-    ContentView()
+    ContentView(model: ExportModel())
 }
