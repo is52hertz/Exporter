@@ -99,6 +99,7 @@ final class HealthKitManager {
     // 二者均为 Sendable / 线程安全，标 nonisolated 以便后台线程的查询方法访问。
     private nonisolated let healthStore = HKHealthStore()
     private nonisolated let anchorStore = AnchorStore()
+    private nonisolated let backgroundAnchorStore = AnchorStore(keyPrefix: "backgroundAnchor")
 
     /// 同时进行的 HealthKit 查询上限（全量近 200 类型，避免无界并发）。
     private nonisolated static let maxConcurrentQueries = 12
@@ -107,6 +108,36 @@ final class HealthKitManager {
     private(set) var hasRequestedAuthorization = false
 
     nonisolated var isHealthDataAvailable: Bool { HKHealthStore.isHealthDataAvailable() }
+
+    nonisolated static func supportsBackgroundPush(_ metric: HealthMetric) -> Bool {
+        !isPerObjectAuthorized(metric) && metric.sampleType != nil
+    }
+
+    func observe(_ metric: HealthMetric, update: @escaping @MainActor @Sendable (HKObserverQuery, @escaping () -> Void) -> Void) -> HKObserverQuery? {
+        guard let type = metric.sampleType else { return nil }
+        let query = HKObserverQuery(sampleType: type, predicate: nil) { query, completion, error in
+            guard error == nil else {
+                completion()
+                return
+            }
+            Task { @MainActor in update(query, completion) }
+        }
+        healthStore.execute(query)
+        return query
+    }
+
+    func stopObserving(_ query: HKObserverQuery) {
+        healthStore.stop(query)
+    }
+
+    func setBackgroundDelivery(_ enabled: Bool, for metric: HealthMetric) async throws {
+        guard let type = metric.sampleType else { return }
+        if enabled {
+            try await healthStore.enableBackgroundDelivery(for: type, frequency: .hourly)
+        } else {
+            try await healthStore.disableBackgroundDelivery(for: type)
+        }
+    }
 
     /// 个人特征类型（出生日期/性别/血型/肤型/轮椅/活动模式），随样本类型一并请求读权限。
     private nonisolated static var characteristicTypes: [HKObjectType] {
@@ -227,8 +258,10 @@ final class HealthKitManager {
                            mode: SyncMode,
                            start: Date?,
                            end: Date?,
-                           maxLookback: TimeInterval? = nil) async throws -> FetchOutcome {
+                           maxLookback: TimeInterval? = nil,
+                           background: Bool = false) async throws -> FetchOutcome {
         guard isHealthDataAvailable else { throw HealthError.unavailable }
+        let anchorsToRead = background ? backgroundAnchorStore : anchorStore
         typealias Part = (samples: [HealthSample], anchor: FetchOutcome.PendingAnchor?, skipped: HealthMetric?)
         return try await withThrowingTaskGroup(of: Part.self) { group in
             func submit(_ metric: HealthMetric, to group: inout ThrowingTaskGroup<Part, Error>) {
@@ -236,7 +269,8 @@ final class HealthKitManager {
                     do {
                         switch mode {
                         case .incremental:
-                            let (samples, anchorData) = try await self.fetchIncremental(metric, maxLookback: maxLookback)
+                            let (samples, anchorData) = try await self.fetchIncremental(
+                                metric, maxLookback: maxLookback, anchors: anchorsToRead)
                             let pending = anchorData.map { FetchOutcome.PendingAnchor(metric: metric, anchorData: $0) }
                             return (samples, pending, nil)
                         case .range:
@@ -289,9 +323,10 @@ final class HealthKitManager {
     }
 
     /// 提交一次增量读取的 anchor（仅在用户确认导出后调用）。
-    func commit(_ outcome: FetchOutcome) {
+    func commit(_ outcome: FetchOutcome, background: Bool = false) {
+        let store = background ? backgroundAnchorStore : anchorStore
         for pending in outcome.pendingAnchors {
-            anchorStore.saveArchivedAnchor(pending.anchorData, for: pending.metric)
+            store.saveArchivedAnchor(pending.anchorData, for: pending.metric)
         }
     }
 
@@ -299,9 +334,10 @@ final class HealthKitManager {
 
     /// 返回归一化样本与新 anchor（归档为 Data），**不**落盘 anchor。
     private nonisolated func fetchIncremental(_ metric: HealthMetric,
-                                              maxLookback: TimeInterval?) async throws -> ([HealthSample], Data?) {
+                                              maxLookback: TimeInterval?,
+                                              anchors: AnchorStore) async throws -> ([HealthSample], Data?) {
         guard let type = metric.sampleType else { return ([], nil) }
-        let storedAnchor = anchorStore.anchor(for: metric)
+        let storedAnchor = anchors.anchor(for: metric)
         let predicate = Self.lookbackPredicate(maxLookback)
         let (samples, newAnchor): ([HKSample], HKQueryAnchor?) = try await withCheckedThrowingContinuation { continuation in
             let query = HKAnchoredObjectQuery(
