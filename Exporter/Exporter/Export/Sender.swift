@@ -43,6 +43,15 @@ nonisolated struct HTTPSender: ExportSender {
     static let secureSession = URLSession(configuration: .ephemeral,
                                           delegate: NoRedirectDelegate(), delegateQueue: nil)
 
+    /// 后台推送专用：同样拒绝一切重定向、全进程只建一次，但保留后台的短时限
+    /// （单次请求 15 秒、总时限 20 秒），不把短时限套到手动大导出上。
+    static let backgroundSession: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 15
+        config.timeoutIntervalForResource = 20
+        return URLSession(configuration: config, delegate: NoRedirectDelegate(), delegateQueue: nil)
+    }()
+
     /// 只接受带主机名的 https 地址；其余（http、无主机、其他协议）一律拒绝。
     static func validatedURL(_ s: String) -> URL? {
         guard let url = URL(string: s), url.scheme?.lowercased() == "https",

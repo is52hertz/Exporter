@@ -22,19 +22,17 @@ final class BackgroundDelivery {
         fetch: { [health] metrics in
             try await health.fetch(metrics: metrics, mode: .incremental, start: nil, end: nil, background: true)
         },
-        sender: { [session] config in
-            HTTPSender(endpoint: config.endpoint, authorizationHeader: config.authorizationHeader, session: session)
-        },
+        sender: { config in BackgroundDelivery.makeSender(config) },
         commit: { [health] outcome in health.commit(outcome, background: true) },
         device: .init(model: UIDevice.current.model,
                       os: "\(UIDevice.current.systemName) \(UIDevice.current.systemVersion)"))
 
-    private let session: URLSession = {
-        let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 15
-        config.timeoutIntervalForResource = 20
-        return URLSession(configuration: config, delegate: BackgroundPushRedirectPolicy(), delegateQueue: nil)
-    }()
+    /// 后台推送走和手动发送同一个发送器（HTTPSender：只发 https、拒绝一切重定向），
+    /// 会话用全进程共用的 HTTPSender.backgroundSession。
+    nonisolated static func makeSender(_ config: BackgroundPush.Configuration) -> HTTPSender {
+        HTTPSender(endpoint: config.endpoint, authorizationHeader: config.authorizationHeader,
+                   session: HTTPSender.backgroundSession)
+    }
 
     init(settings: AppSettings, health: HealthKitManager) {
         self.settings = settings

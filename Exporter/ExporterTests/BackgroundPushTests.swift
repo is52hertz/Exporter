@@ -127,6 +127,41 @@ struct BackgroundPushTests {
         }
     }
 
+    /// 后台推送走 HTTPSender，会话是全进程共用、拒绝一切重定向的 backgroundSession，
+    /// 并保留后台的 15 秒 / 20 秒时限；手动发送的会话时限不受影响。
+    @Test func backgroundSenderUsesSharedNoRedirectSession() {
+        let config = BackgroundPush.Configuration(metrics: [], endpoint: "https://a.example/hook",
+                                                  authorizationHeader: "Bearer t", includeUUID: false)
+        let first = BackgroundDelivery.makeSender(config)
+        let second = BackgroundDelivery.makeSender(config)
+        #expect(first.session === HTTPSender.backgroundSession)
+        #expect(second.session === first.session, "每次推送都复用同一个会话")
+        #expect(first.endpoint == config.endpoint)
+        #expect(first.session.delegate is NoRedirectDelegate)
+        #expect(first.session.configuration.timeoutIntervalForRequest == 15)
+        #expect(first.session.configuration.timeoutIntervalForResource == 20)
+        #expect(HTTPSender.secureSession !== HTTPSender.backgroundSession)
+        #expect(HTTPSender.secureSession.delegate is NoRedirectDelegate)
+        #expect(HTTPSender.secureSession.configuration.timeoutIntervalForResource > 20,
+                "手动大导出不套用后台短时限")
+    }
+
+    /// 后台会话的重定向回调：跨主机 https 与降级到 http 都拿到 nil，不发后续请求。
+    @Test func backgroundSessionRefusesRedirects() throws {
+        let session = HTTPSender.backgroundSession
+        let delegate = try #require(session.delegate as? NoRedirectDelegate)
+        let task = session.dataTask(with: URL(string: "https://a.example/hook")!)
+        defer { task.cancel() }
+        for target in ["https://b.example/steal", "http://a.example/hook"] {
+            let resp = HTTPURLResponse(url: URL(string: "https://a.example/hook")!, statusCode: 307,
+                                       httpVersion: nil, headerFields: ["Location": target])!
+            var followed: URLRequest? = URLRequest(url: URL(string: "https://sentinel.example")!)
+            delegate.urlSession(session, task: task, willPerformHTTPRedirection: resp,
+                                newRequest: URLRequest(url: URL(string: target)!)) { followed = $0 }
+            #expect(followed == nil, "后台推送重定向到 \(target) 不应被跟随")
+        }
+    }
+
     private nonisolated struct FakeSender: ExportSender {
         let operation: @MainActor @Sendable (Data) throws -> Void
 
