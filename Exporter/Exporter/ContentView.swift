@@ -173,8 +173,18 @@ struct ContentView: View {
             .buttonStyle(.glassProminent)
             .disabled(!model.canRead)
         } footer: {
-            if let status = model.statusMessage {
-                Text(status)
+            VStack(alignment: .leading, spacing: 4) {
+                if let status = model.statusMessage {
+                    Text(status)
+                }
+                if let receipt = model.settings.lastSendReceipt {
+                    switch receipt.destination {
+                    case .primary:
+                        Text("上次发送：主地址 · \(receipt.host)")
+                    case .backup:
+                        Text("上次发送：备用地址 · \(receipt.host)")
+                    }
+                }
             }
         }
     }
@@ -320,7 +330,7 @@ struct ContentView: View {
 
     private var errorPresented: Binding<Bool> {
         Binding(
-            get: { model.errorMessage != nil },
+            get: { !model.showPreview && model.errorMessage != nil },
             set: { if !$0 { model.errorMessage = nil } }
         )
     }

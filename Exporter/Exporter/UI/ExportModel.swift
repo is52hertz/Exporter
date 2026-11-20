@@ -445,6 +445,7 @@ final class ExportModel {
     // MARK: 发送
 
     func send() async {
+        guard !isWorking else { return }
         guard settings.hasEndpoint else {
             errorMessage = "未配置 API endpoint，可在设置中填写，或使用分享导出。"
             return
@@ -458,12 +459,21 @@ final class ExportModel {
         defer { isWorking = false }
         do {
             let sender = HTTPSender(endpoint: settings.endpoint,
+                                    backupEndpoint: settings.backupEndpoint,
                                     authorizationHeader: settings.authorizationHeader)
             let data = try await Task.detached(priority: .userInitiated) {
                 try Data(contentsOf: fileURL)
             }.value
-            try await sender.send(data)
-            statusMessage = "已发送 \(sampleCount) 条样本。"
+            let receipt = try await sender.send(data)
+            settings.lastSendReceipt = receipt
+            switch receipt.destination {
+            case .primary:
+                statusMessage = sender.backupEndpoint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? "已发送 \(sampleCount) 条样本。"
+                    : "已发送 \(sampleCount) 条样本（主地址）。"
+            case .backup:
+                statusMessage = "主地址连不上，已改发备用地址：\(sampleCount) 条样本。"
+            }
         } catch {
             errorMessage = error.localizedDescription
         }

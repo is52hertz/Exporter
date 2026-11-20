@@ -13,14 +13,69 @@ import Foundation
 final class AppSettings {
     private let defaults: UserDefaults
 
-    /// 远程 API endpoint（留空则只走本地预览 / 分享）。
+    /// 设置页编辑值的副本；地址校验时去掉首尾空白，持久化时保留原始输入。
+    nonisolated struct EndpointDraft: Equatable, Sendable {
+        var endpoint: String
+        var backupEndpoint: String
+        var authorizationHeader: String
+
+        var trimmedEndpoint: String { endpoint.trimmingCharacters(in: .whitespacesAndNewlines) }
+        var trimmedBackupEndpoint: String { backupEndpoint.trimmingCharacters(in: .whitespacesAndNewlines) }
+        var hasValidPrimaryEndpoint: Bool { HTTPSender.validatedURL(trimmedEndpoint) != nil }
+        var validatedBackupURL: URL? { HTTPSender.validatedBackupURL(trimmedBackupEndpoint) }
+
+        var isValid: Bool {
+            let hasPrimary = !trimmedEndpoint.isEmpty
+            guard !hasPrimary || hasValidPrimaryEndpoint else { return false }
+            return trimmedBackupEndpoint.isEmpty || (hasPrimary && validatedBackupURL != nil)
+        }
+    }
+
+    /// 三个字段共用一个观察及持久化快照，编辑副本不会通知发送方。
+    private(set) var endpointDraft: EndpointDraft {
+        didSet { Self.persistEndpointDraft(endpointDraft, in: defaults) }
+    }
+
+    @discardableResult
+    func applyEndpointDraft(_ draft: EndpointDraft) -> Bool {
+        guard draft.isValid else { return false }
+        if draft != endpointDraft { endpointDraft = draft }
+        return true
+    }
+
+    func canEnableBackgroundPush(with draft: EndpointDraft) -> Bool {
+        draft == endpointDraft && draft.hasValidPrimaryEndpoint && draft.isValid
+    }
+
+    func setBackgroundPushEnabled(_ enabled: Bool, with draft: EndpointDraft) {
+        // 关闭立即生效；开启只允许使用未被草稿改动的有效已保存配置。
+        guard !enabled || canEnableBackgroundPush(with: draft) else { return }
+        backgroundPushEnabled = enabled
+    }
+
+    // 兼容既有读写方；设置页通过 applyEndpointDraft 一次替换整组配置。
     var endpoint: String {
-        didSet { defaults.set(endpoint, forKey: Keys.endpoint) }
+        get { endpointDraft.endpoint }
+        set { endpointDraft.endpoint = newValue }
+    }
+
+    var backupEndpoint: String {
+        get { endpointDraft.backupEndpoint }
+        set { endpointDraft.backupEndpoint = newValue }
+    }
+
+    /// 最近一次服务器确认成功的地址，只保存主机名，不保存路径、查询参数或凭据。
+    var lastSendReceipt: SendReceipt? {
+        didSet {
+            let stored = lastSendReceipt.flatMap { try? JSONEncoder().encode($0) }
+            defaults.set(stored, forKey: Keys.lastSendReceipt)
+        }
     }
 
     /// 可选 Authorization 头的值，如 "Bearer xxx"。
     var authorizationHeader: String {
-        didSet { defaults.set(authorizationHeader, forKey: Keys.authHeader) }
+        get { endpointDraft.authorizationHeader }
+        set { endpointDraft.authorizationHeader = newValue }
     }
 
     var backgroundPushEnabled: Bool {
@@ -72,8 +127,10 @@ final class AppSettings {
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
-        self.endpoint = defaults.string(forKey: Keys.endpoint) ?? ""
-        self.authorizationHeader = defaults.string(forKey: Keys.authHeader) ?? ""
+        self.endpointDraft = Self.loadEndpointDraft(from: defaults)
+        self.lastSendReceipt = defaults.data(forKey: Keys.lastSendReceipt).flatMap {
+            try? JSONDecoder().decode(SendReceipt.self, from: $0)
+        }
         self.backgroundPushEnabled = defaults.bool(forKey: Keys.backgroundPushEnabled)
 
         if let raw = defaults.array(forKey: Keys.selectedMetrics) as? [String] {
@@ -99,8 +156,38 @@ final class AppSettings {
         self.hasRequestedAuthorization = defaults.bool(forKey: Keys.hasRequestedAuth)
     }
 
+    private static func loadEndpointDraft(from defaults: UserDefaults) -> EndpointDraft {
+        if let stored = defaults.dictionary(forKey: Keys.endpointConfiguration),
+           let endpoint = stored[Keys.endpoint] as? String,
+           let backup = stored[Keys.backupEndpoint] as? String,
+           let header = stored[Keys.authHeader] as? String {
+            return EndpointDraft(endpoint: endpoint, backupEndpoint: backup, authorizationHeader: header)
+        }
+
+        let endpoint = defaults.string(forKey: Keys.endpoint)
+        let backup = defaults.string(forKey: Keys.backupEndpoint)
+        let header = defaults.string(forKey: Keys.authHeader)
+        let migrated = EndpointDraft(endpoint: endpoint ?? "", backupEndpoint: backup ?? "", authorizationHeader: header ?? "")
+        if endpoint != nil || backup != nil || header != nil {
+            // 先写完整快照再清理旧键，避免留下旧的 Authorization 值。
+            persistEndpointDraft(migrated, in: defaults)
+            for key in [Keys.endpoint, Keys.backupEndpoint, Keys.authHeader] {
+                defaults.removeObject(forKey: key)
+            }
+        }
+        return migrated
+    }
+
+    private static func persistEndpointDraft(_ draft: EndpointDraft, in defaults: UserDefaults) {
+        defaults.set([Keys.endpoint: draft.endpoint, Keys.backupEndpoint: draft.backupEndpoint,
+                      Keys.authHeader: draft.authorizationHeader], forKey: Keys.endpointConfiguration)
+    }
+
     private enum Keys {
+        static let endpointConfiguration = "settings.endpointConfiguration"
         static let endpoint = "settings.endpoint"
+        static let backupEndpoint = "settings.backupEndpoint"
+        static let lastSendReceipt = "settings.lastSendReceipt"
         static let authHeader = "settings.authHeader"
         static let backgroundPushEnabled = "settings.backgroundPushEnabled"
         static let selectedMetrics = "settings.selectedMetrics"
