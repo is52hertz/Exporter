@@ -1,5 +1,4 @@
 import HealthKit
-import Observation
 import OSLog
 import UIKit
 
@@ -12,26 +11,35 @@ final class BackgroundDelivery {
     private let logger = Logger(subsystem: "cn.Teethe.Exporter", category: "BackgroundDelivery")
     private var observers: [HealthMetric: HKObserverQuery] = [:]
     private var configuration: BackgroundPush.Configuration?
+    private var configurationNeedsRefresh = false
     private var registrations = Set<HealthMetric>()
     private var enabledThisLaunch = Set<HealthMetric>()
     private var registrationWorker: Task<Void, Never>?
     private var registrationsChanged = false
 
     private lazy var push = BackgroundPush(
-        configuration: { [weak self] in self?.currentConfiguration() },
+        configuration: { [weak self] in
+            guard let self, !self.configurationNeedsRefresh else { return nil }
+            return self.configuration
+        },
         fetch: { [health] metrics in
             try await health.fetch(metrics: metrics, mode: .incremental, start: nil, end: nil, background: true)
         },
-        sender: { config in BackgroundDelivery.makeSender(config) },
-        commit: { [health] outcome in health.commit(outcome, background: true) },
+        sender: { config, startAuthorization in BackgroundDelivery.makeSender(config, startAuthorization: startAuthorization) },
+        commit: { [health, settings] outcome, receipt in
+            health.commit(outcome, background: true)
+            settings.lastSendReceipt = receipt
+        },
         device: .init(model: UIDevice.current.model,
                       os: "\(UIDevice.current.systemName) \(UIDevice.current.systemVersion)"))
 
-    /// 后台推送走和手动发送同一个发送器（HTTPSender：只发 https、拒绝一切重定向），
-    /// 会话用全进程共用的 HTTPSender.backgroundSession。
-    nonisolated static func makeSender(_ config: BackgroundPush.Configuration) -> HTTPSender {
-        HTTPSender(endpoint: config.endpoint, authorizationHeader: config.authorizationHeader,
-                   session: HTTPSender.backgroundSession)
+    /// 后台推送与手动发送共用 HTTPSender 的地址校验、备用地址逻辑及重定向限制。
+    /// 后台使用全进程共用的 HTTPSender.backgroundSession。
+    nonisolated static func makeSender(_ config: BackgroundPush.Configuration,
+                                       startAuthorization: POSTStartAuthorization? = nil) -> HTTPSender {
+        HTTPSender(endpoint: config.endpoint, backupEndpoint: config.backupEndpoint,
+                   authorizationHeader: config.authorizationHeader, session: HTTPSender.backgroundSession,
+                   startAuthorization: startAuthorization)
     }
 
     init(settings: AppSettings, health: HealthKitManager) {
@@ -48,33 +56,40 @@ final class BackgroundDelivery {
     func currentConfiguration() -> BackgroundPush.Configuration? {
         guard settings.backgroundPushEnabled else { return nil }
         let endpoint = settings.endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
-        // 和发送器同一条规则：只有带主机名的 https 地址才算已配置，http 地址不注册、不读取。
-        guard HTTPSender.validatedURL(endpoint) != nil else { return nil }
+        let backupEndpoint = settings.backupEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard HTTPSender.validatedURL(endpoint) != nil,
+              backupEndpoint.isEmpty || HTTPSender.validatedBackupURL(backupEndpoint) != nil else { return nil }
         let metrics = HealthMetric.registered.filter {
             settings.selectedMetrics.contains($0) && HealthKitManager.supportsBackgroundPush($0)
         }
         guard !metrics.isEmpty else { return nil }
-        return .init(metrics: metrics, endpoint: endpoint, authorizationHeader: settings.authorizationHeader,
-                     includeUUID: settings.includeUUID)
+        return .init(metrics: metrics, endpoint: endpoint, backupEndpoint: backupEndpoint,
+                     authorizationHeader: settings.authorizationHeader, includeUUID: settings.includeUUID)
     }
 
     private func applySettings() {
-        let updated = withObservationTracking {
+        let updated = push.trackConfiguration {
             // Reconcile again after the user completes the authorization flow.
             _ = settings.hasRequestedAuthorization
             return currentConfiguration()
         } onChange: { [weak self] in
-            Task { @MainActor [weak self] in self?.applySettings() }
+            // Transport permission is already revoked. Refresh after the setting is written.
+            self?.configurationNeedsRefresh = true
+            Task { @MainActor [weak self] in self?.refreshSettingsIfNeeded() }
         }
 
-        if configuration != updated, configuration != nil { push.cancel() }
+        if configuration != nil, configurationNeedsRefresh || configuration != updated { push.cancel() }
         configuration = updated
+        configurationNeedsRefresh = false
         let desired = Set(updated?.metrics ?? [])
         for metric in Set(observers.keys).subtracting(desired) {
             if let query = observers.removeValue(forKey: metric) { health.stopObserving(query) }
         }
         for metric in desired where observers[metric] == nil {
             observers[metric] = health.observe(metric) { [weak self] query, completion in
+                // A wake can already be queued ahead of the deferred settings refresh. Evaluate
+                // it with the saved replacement, not the revoked snapshot.
+                self?.refreshSettingsIfNeeded()
                 guard let self, self.observers[metric] === query else {
                     completion()
                     return
@@ -89,13 +104,17 @@ final class BackgroundDelivery {
         }
     }
 
+    private func refreshSettingsIfNeeded() {
+        if configurationNeedsRefresh { applySettings() }
+    }
+
     private func reconcileRegistrations() async {
         defer { registrationWorker = nil }
         while registrationsChanged {
             registrationsChanged = false
             let desired = Set(observers.keys)
             for metric in registrations.subtracting(desired) {
-                if registrationsChanged { break }
+                if registrationsChanged || configurationNeedsRefresh { break }
                 enabledThisLaunch.remove(metric)
                 do {
                     try await health.setBackgroundDelivery(false, for: metric)
@@ -106,7 +125,7 @@ final class BackgroundDelivery {
                 }
             }
             for metric in desired.subtracting(enabledThisLaunch) {
-                if registrationsChanged { break }
+                if registrationsChanged || configurationNeedsRefresh { break }
                 registrations.insert(metric)
                 persistRegistrations()
                 do {

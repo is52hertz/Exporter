@@ -24,6 +24,11 @@ struct JSONPreviewView: View {
             }
             .navigationTitle("\(model.sampleCount) 条样本")
             .navigationBarTitleDisplayMode(.inline)
+            .alert("发送提示", isPresented: errorPresented) {
+                Button("好", role: .cancel) {}
+            } message: {
+                Text(model.errorMessage ?? "")
+            }
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     Button("关闭") { dismiss() }
@@ -47,6 +52,13 @@ struct JSONPreviewView: View {
                 }
             }
         }
+    }
+
+    private var errorPresented: Binding<Bool> {
+        Binding(
+            get: { model.errorMessage != nil },
+            set: { if !$0 { model.errorMessage = nil } }
+        )
     }
 
     // MARK: 摘要

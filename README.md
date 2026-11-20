@@ -43,7 +43,7 @@ JSON schema, and lets you either **preview / share it locally** or **POST it to 
 you configure**. It is **read-only** with respect to HealthKit — it never writes, never deletes.
 
 It is a small, single-user app built for **personal / self-use** — **not** the App Store. Nothing
-leaves your device except to the **one endpoint you explicitly configure**: no accounts, no
+leaves your device except to the **primary or optional backup address you explicitly configure**: no accounts, no
 telemetry, no third parties.
 
 The exported JSON is designed to be compact and easy for both **humans and LLMs** to read: samples
@@ -148,8 +148,15 @@ xcodebuild test -project Exporter/Exporter.xcodeproj -scheme Exporter \
 ## 🕵️ Privacy
 
 Read-only with respect to HealthKit. No accounts, no analytics, no telemetry. Your health data
-never leaves the device **except** to the single remote endpoint you explicitly enter in Settings —
-and only when you confirm the send. No private APIs, no downloaded/arbitrary code execution.
+only goes to the addresses you save by tapping Done in Settings, when you send manually or opt into background
+push. The primary must use HTTPS; the optional backup can use HTTP only for private or link-local
+IP addresses and `.local` names. On HTTP, health data and the Authorization header are not encrypted;
+use it only on a network you trust. For `.local` names, Exporter relies on the device's normal name
+resolution and routing; the name itself does not authenticate the receiver. Try a manual send on
+your local network first and allow local network access if iOS asks. The app only switches to the
+backup if it can confirm no request reached the primary; it never follows redirects or switches
+after an HTTP response. If the result is unconfirmed, check the receiver before resending. No
+private APIs or arbitrary code execution.
 
 ---
 
