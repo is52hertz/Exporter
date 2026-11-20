@@ -47,6 +47,10 @@ final class AppSettings {
     }
 
     /// 导出跨度超过该天数时弹确认（默认 3 天）。
+    /// 允许范围与设置界面共用同一常量，避免加载端与控件分叉（R2）；
+    /// 扩大范围（如 365 天）属产品决策，需同步修改此处与 SettingsView。
+    static let largeExportThresholdRange = 1...30
+
     var largeExportThresholdDays: Int {
         didSet { defaults.set(largeExportThresholdDays, forKey: Keys.thresholdDays) }
     }
@@ -83,8 +87,14 @@ final class AppSettings {
         self.rangeStart = Calendar.current.date(byAdding: .day, value: -7, to: now) ?? now
 
         self.lastSyncDate = defaults.object(forKey: Keys.lastSyncDate) as? Date
+        // 夹紧到界面允许的 1...30：防御损坏 / 未来版本写入的越界存量值——
+        // 0 或负数会让每次导出都弹确认、「仅最近 0 天」导出空范围；
+        // 超大值则让「最近 N 天」超出用户在现有控件中能选出的范围（R2）。
         let storedThreshold = defaults.object(forKey: Keys.thresholdDays) as? Int
-        self.largeExportThresholdDays = storedThreshold ?? 3
+        self.largeExportThresholdDays = storedThreshold.map {
+            min(max($0, Self.largeExportThresholdRange.lowerBound),
+                Self.largeExportThresholdRange.upperBound)
+        } ?? 3
         self.includeUUID = defaults.object(forKey: Keys.includeUUID) as? Bool ?? false
         self.hasRequestedAuthorization = defaults.bool(forKey: Keys.hasRequestedAuth)
     }

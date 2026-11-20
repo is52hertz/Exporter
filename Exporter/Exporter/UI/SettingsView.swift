@@ -36,7 +36,7 @@ struct SettingsView: View {
                 }
 
                 Section {
-                    Stepper(value: $settings.largeExportThresholdDays, in: 1...30) {
+                    Stepper(value: $settings.largeExportThresholdDays, in: AppSettings.largeExportThresholdRange) {
                         Text("大导出确认阈值：\(settings.largeExportThresholdDays) 天")
                     }
                     Toggle("样本包含 UUID", isOn: $settings.includeUUID)

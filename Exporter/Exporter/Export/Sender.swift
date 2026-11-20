@@ -15,6 +15,7 @@ nonisolated protocol ExportSender: Sendable {
 nonisolated enum SenderError: LocalizedError {
     case missingEndpoint
     case invalidURL(String)
+    case insecureScheme(String)
     case httpStatus(Int, body: String?)
 
     var errorDescription: String? {
@@ -23,6 +24,8 @@ nonisolated enum SenderError: LocalizedError {
             return "未配置 API endpoint。"
         case .invalidURL(let s):
             return "endpoint 不是合法 URL：\(s)"
+        case .insecureScheme(let s):
+            return "endpoint 必须使用 https：\(s)"
         case .httpStatus(let code, let body):
             return "服务器返回 \(code)。\(body ?? "")"
         }
@@ -33,12 +36,36 @@ nonisolated enum SenderError: LocalizedError {
 nonisolated struct HTTPSender: ExportSender {
     let endpoint: String
     let authorizationHeader: String?
-    var session: URLSession = .shared
+    /// 默认会话使用拒绝一切重定向的代理，只向用户配置的单一地址发送。
+    var session: URLSession = HTTPSender.secureSession
+
+    /// 全进程共用一个拒绝重定向的会话：不会每次发送都新建会话而不回收。
+    static let secureSession = URLSession(configuration: .ephemeral,
+                                          delegate: NoRedirectDelegate(), delegateQueue: nil)
+
+    /// 后台推送专用：同样拒绝一切重定向、全进程只建一次，但保留后台的短时限
+    /// （单次请求 15 秒、总时限 20 秒），不把短时限套到手动大导出上。
+    static let backgroundSession: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 15
+        config.timeoutIntervalForResource = 20
+        return URLSession(configuration: config, delegate: NoRedirectDelegate(), delegateQueue: nil)
+    }()
+
+    /// 只接受带主机名的 https 地址；其余（http、无主机、其他协议）一律拒绝。
+    static func validatedURL(_ s: String) -> URL? {
+        guard let url = URL(string: s), url.scheme?.lowercased() == "https",
+              let host = url.host, !host.isEmpty else { return nil }
+        return url
+    }
 
     func send(_ data: Data) async throws {
         let trimmed = endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { throw SenderError.missingEndpoint }
-        guard let url = URL(string: trimmed), url.scheme != nil else {
+        guard let url = Self.validatedURL(trimmed) else {
+            if let u = URL(string: trimmed), u.scheme != nil, u.scheme?.lowercased() != "https" {
+                throw SenderError.insecureScheme(trimmed)
+            }
             throw SenderError.invalidURL(trimmed)
         }
 
@@ -56,5 +83,18 @@ nonisolated struct HTTPSender: ExportSender {
             let body = String(data: respData, encoding: .utf8)
             throw SenderError.httpStatus(http.statusCode, body: body)
         }
+    }
+}
+
+/// 只向用户配置的单一地址发送：任何 30x 重定向一律不跟随（返回 nil 即把 30x 响应原样交回，
+/// 随后按非 2xx 报错），避免健康数据与凭据被转到未配置的主机，包括 https 到另一个 https 主机。
+nonisolated final class NoRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    static func shouldFollow(to url: URL?) -> Bool { false }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest,
+                    completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(Self.shouldFollow(to: request.url) ? request : nil)
     }
 }

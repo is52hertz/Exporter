@@ -153,7 +153,37 @@ final class ExportModel {
 
     // MARK: 导出入口
 
+    /// 一次导出所用设置的快照：弹层出现 / 导出启动时取一次，之后估算与最终导出都读这份，
+    /// 估算期间改设置不会让导出的时间范围、模式与估算互相矛盾。
+    struct ExportSnapshot: Equatable {
+        let mode: SyncMode
+        let rangeStart: Date
+        let rangeEnd: Date
+        let includeUUID: Bool
+        let thresholdDays: Int
+    }
+
+    private(set) var confirmSnapshot: ExportSnapshot?
+
+    /// 「仅最近 N 天」的快照：模式改为 range、起止为最近 N 天，文件里标注的范围与实际查询一致。
+    static func recentSnapshot(from snap: ExportSnapshot, now: Date) -> ExportSnapshot {
+        ExportSnapshot(mode: .range,
+                       rangeStart: now.addingTimeInterval(-Double(snap.thresholdDays) * 86_400),
+                       rangeEnd: now, includeUUID: snap.includeUUID, thresholdDays: snap.thresholdDays)
+    }
+
+    private func makeSnapshot() -> ExportSnapshot {
+        ExportSnapshot(mode: settings.mode, rangeStart: settings.rangeStart,
+                       rangeEnd: settings.rangeEnd, includeUUID: settings.includeUUID,
+                       thresholdDays: settings.largeExportThresholdDays)
+    }
+
     func startExport() {
+        // 重入守护：估算进行中（确认弹层在显示）或导出执行中时拒绝再次进入。
+        // 估算期间 isWorking 仍为 false，必须靠 confirm 非空拦住，否则再次 startExport
+        // 会取消并重启同一估算、清空 pendingOutcome（R1）。估算失败/取消后 confirm 归
+        // nil，可正常重新开始。
+        guard !isWorking, confirm == nil else { return }
         guard canRead else {
             errorMessage = "请至少选择一个指标。"
             return
@@ -202,13 +232,15 @@ final class ExportModel {
     // MARK: 确认流程
 
     private func presentConfirm() {
-        let recent = settings.largeExportThresholdDays
+        let snap = makeSnapshot()
+        confirmSnapshot = snap
+        let recent = snap.thresholdDays
         confirm = LargeExportConfirm(spanText: spanText(), estimatedCount: nil, recentDays: recent)
 
         let metrics = selectedMetricsInOrder
-        let mode = settings.mode
-        let start = rangeStartIfNeeded
-        let end = rangeEndIfNeeded
+        let mode = snap.mode
+        let start = snap.mode == .range ? snap.rangeStart : nil
+        let end = snap.mode == .range ? snap.rangeEnd : nil
 
         fetchTask?.cancel()
         pendingOutcome = nil
@@ -230,30 +262,38 @@ final class ExportModel {
     /// 继续导出全部：复用确认阶段已取的样本，不重复查询。
     func confirmContinueAll() {
         guard let outcome = pendingOutcome else { return }   // 估算未完成时按钮应禁用
+        // 连点守护：同步置 isWorking，同一 runloop 内的第二次点击直接被拦下。
+        guard !isWorking else { return }
+        isWorking = true
+        let snap = confirmSnapshot ?? makeSnapshot()
         confirm = nil
+        confirmSnapshot = nil
         pendingOutcome = nil
         Task {
-            isWorking = true
             defer { isWorking = false }
-            await finishExport(outcome: outcome, isFullIncremental: outcome.isIncremental)
+            await finishExport(outcome: outcome, isFullIncremental: outcome.isIncremental, snapshot: snap)
         }
     }
 
     /// 仅导出最近 N 天：取消进行中的全量查询，改跑局部 range 读取（不动 anchor / lastSyncDate）。
     func confirmRecentOnly() {
-        let days = settings.largeExportThresholdDays
+        // 连点守护：同步置 isWorking，同一 runloop 内的第二次点击直接被拦下。
+        guard !isWorking else { return }
+        isWorking = true
+        let snap = confirmSnapshot ?? makeSnapshot()
         let metrics = selectedMetricsInOrder
         confirm = nil
+        confirmSnapshot = nil
         fetchTask?.cancel()
         pendingOutcome = nil
-        let end = Date()
-        let start = end.addingTimeInterval(-Double(days) * 86_400)
+        let recentSnap = Self.recentSnapshot(from: snap, now: Date())
+        let start = recentSnap.rangeStart
+        let end = recentSnap.rangeEnd
         Task {
-            isWorking = true
             defer { isWorking = false }
             do {
                 let outcome = try await health.fetch(metrics: metrics, mode: .range, start: start, end: end)
-                await finishExport(outcome: outcome, isFullIncremental: false)
+                await finishExport(outcome: outcome, isFullIncremental: false, snapshot: recentSnap)
             } catch {
                 errorMessage = error.localizedDescription
             }
@@ -264,38 +304,41 @@ final class ExportModel {
         fetchTask?.cancel()
         pendingOutcome = nil
         confirm = nil
+        confirmSnapshot = nil
     }
 
     // MARK: 执行
 
     private func runExport(mode: SyncMode, start: Date?, end: Date?, isFullIncremental: Bool) {
+        // 连点守护：同步置 isWorking（原来在 Task 体内，同一 runloop 内连点会双启动）。
+        guard !isWorking else { return }
+        isWorking = true
+        let snap = makeSnapshot()
         let metrics = selectedMetricsInOrder
         Task {
-            isWorking = true
             defer { isWorking = false }
             do {
                 let outcome = try await health.fetch(metrics: metrics, mode: mode, start: start, end: end)
-                await finishExport(outcome: outcome, isFullIncremental: isFullIncremental)
+                await finishExport(outcome: outcome, isFullIncremental: isFullIncremental, snapshot: snap)
             } catch {
                 errorMessage = error.localizedDescription
             }
         }
     }
 
-    /// 提交 anchor（仅全量增量）、序列化并落盘 JSON、打开预览。
-    private func finishExport(outcome: HealthKitManager.FetchOutcome, isFullIncremental: Bool) async {
-        if isFullIncremental {
-            health.commit(outcome)
-            settings.lastSyncDate = Date()
-        }
+    /// 序列化并落盘 JSON、打开预览；文件成功落盘后才提交 anchor（仅全量增量）。
+    /// 顺序不可颠倒：写盘失败（磁盘满 / 编码错误 / 临时目录被清）时绝不能推进同步位置，
+    /// 否则这些样本下次增量会被永久跳过 —— 这正是 anchor 延迟提交设计要防的失败模式。
+    private func finishExport(outcome: HealthKitManager.FetchOutcome, isFullIncremental: Bool,
+                              snapshot: ExportSnapshot) async {
         let device = ExportDocument.DeviceInfo(
             model: UIDevice.current.model,
             os: "\(UIDevice.current.systemName) \(UIDevice.current.systemVersion)"
         )
         let range = ExportDocument.ExportRange(
-            mode: settings.mode,
-            start: settings.mode == .range ? settings.rangeStart : nil,
-            end: settings.mode == .range ? settings.rangeEnd : nil
+            mode: snapshot.mode,
+            start: snapshot.mode == .range ? snapshot.rangeStart : nil,
+            end: snapshot.mode == .range ? snapshot.rangeEnd : nil
         )
         do {
             let health = self.health
@@ -303,9 +346,14 @@ final class ExportModel {
             let artifact = try await Self.produceArtifact(samples: outcome.samples,
                                                           device: device,
                                                           range: range,
-                                                          includeUUID: settings.includeUUID,
+                                                          includeUUID: snapshot.includeUUID,
                                                           profile: profile,
                                                           replacing: exportFileURL)
+            // 写盘成功，此刻才提交 anchor / lastSyncDate（仅全量增量）。
+            if isFullIncremental {
+                health.commit(outcome)
+                settings.lastSyncDate = Date()
+            }
             exportFileURL = artifact.fileURL
             exportByteCount = artifact.byteCount
             previewSnippet = artifact.snippet
@@ -328,7 +376,7 @@ final class ExportModel {
     }
 
     /// 后台产物：JSON 文件 + 截断预览 + 摘要。主线程只接收这份轻量结构。
-    nonisolated private struct ExportArtifact: Sendable {
+    nonisolated struct ExportArtifact: Sendable {
         let fileURL: URL
         let byteCount: Int
         let snippet: String
@@ -343,7 +391,7 @@ final class ExportModel {
     nonisolated private static let previewByteLimit = 64 * 1024
 
     /// 在后台线程序列化、写临时文件并裁出预览片段，避免阻塞主线程。
-    nonisolated private static func produceArtifact(samples: [HealthSample],
+    nonisolated static func produceArtifact(samples: [HealthSample],
                                                     device: ExportDocument.DeviceInfo,
                                                     range: ExportDocument.ExportRange,
                                                     includeUUID: Bool,
@@ -355,14 +403,16 @@ final class ExportModel {
                                           profile: profile)
             let data = JSONExporter.encode(document)
 
-            if let previousURL {
-                try? FileManager.default.removeItem(at: previousURL)
-            }
+            // 唯一文件名：同一秒内连续导出不会撞名；新文件写成功后才删旧文件，
+            // 写失败时上一份可分享的文件仍在。
             let stamp = Date().formatted(.iso8601.year().month().day()
                 .timeSeparator(.omitted).dateSeparator(.omitted).time(includingFractionalSeconds: false))
             let fileURL = FileManager.default.temporaryDirectory
-                .appendingPathComponent("HealthExport-\(stamp).json")
+                .appendingPathComponent("HealthExport-\(stamp)-\(UUID().uuidString.prefix(8)).json")
             try data.write(to: fileURL, options: .atomic)
+            if let previousURL, previousURL != fileURL {
+                try? FileManager.default.removeItem(at: previousURL)
+            }
 
             let (snippet, truncated) = Self.makeSnippet(from: data)
             var counts: [(String, Int)] = []

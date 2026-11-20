@@ -151,13 +151,14 @@ final class HealthKitManager {
     /// 该指标是否走逐对象授权（不能进 requestAuthorization / getRequestStatus 的读集合，
     /// 否则 HealthKit 抛 NSException）。用药记录的授权挂在 userAnnotatedMedicationType 上，
     /// 其 dose event 类型对标准授权 API 完全禁用，故按 kind 显式排除。
-    private nonisolated static func isPerObjectAuthorized(_ metric: HealthMetric) -> Bool {
+    /// internal（非 private）：供守门单测断言逐对象类型永不进标准读集合。
+    nonisolated static func isPerObjectAuthorized(_ metric: HealthMetric) -> Bool {
         metric.kind == .medicationDose
             || metric.sampleType?.requiresPerObjectAuthorization() == true
     }
 
-    /// 标准授权读集合：排除逐对象授权类型（视力处方/用药记录）。
-    private nonisolated static func standardReadTypes(for metrics: [HealthMetric]) -> Set<HKObjectType> {
+    /// 标准授权读集合：排除逐对象授权类型（视力处方/用药记录）。internal（非 private）：供守门单测。
+    nonisolated static func standardReadTypes(for metrics: [HealthMetric]) -> Set<HKObjectType> {
         let sampleTypes = metrics.filter { !isPerObjectAuthorized($0) }
             .compactMap { $0.sampleType as HKObjectType? }
         return Set(sampleTypes + characteristicTypes)
