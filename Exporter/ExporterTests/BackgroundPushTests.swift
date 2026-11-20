@@ -146,6 +146,23 @@ struct BackgroundPushTests {
                 "手动大导出不套用后台短时限")
     }
 
+    /// 后台注册前就用发送器的同一条规则校验地址：http、无主机都不算已配置，不注册监听。
+    @Test func backgroundConfigurationRequiresHTTPSEndpoint() throws {
+        let suite = "BackgroundPushTests-\(UUID())"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let settings = AppSettings(defaults: defaults)
+        settings.backgroundPushEnabled = true
+        settings.selectedMetrics = [try #require(HealthMetric(rawValue: "stepCount"))]
+        let delivery = BackgroundDelivery(settings: settings, health: HealthKitManager())
+        for bad in ["http://a.example/hook", "https://", "ftp://a.example/x", ""] {
+            settings.endpoint = bad
+            #expect(delivery.currentConfiguration() == nil, "\(bad) 不应注册后台推送")
+        }
+        settings.endpoint = "https://a.example/hook"
+        #expect(delivery.currentConfiguration()?.endpoint == "https://a.example/hook")
+    }
+
     /// 后台会话的重定向回调：跨主机 https 与降级到 http 都拿到 nil，不发后续请求。
     @Test func backgroundSessionRefusesRedirects() throws {
         let session = HTTPSender.backgroundSession

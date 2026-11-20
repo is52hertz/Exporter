@@ -45,11 +45,11 @@ final class BackgroundDelivery {
         applySettings()
     }
 
-    private func currentConfiguration() -> BackgroundPush.Configuration? {
+    func currentConfiguration() -> BackgroundPush.Configuration? {
         guard settings.backgroundPushEnabled else { return nil }
         let endpoint = settings.endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let url = URL(string: endpoint), let scheme = url.scheme?.lowercased(),
-              ["http", "https"].contains(scheme), url.host != nil else { return nil }
+        // 和发送器同一条规则：只有带主机名的 https 地址才算已配置，http 地址不注册、不读取。
+        guard HTTPSender.validatedURL(endpoint) != nil else { return nil }
         let metrics = HealthMetric.registered.filter {
             settings.selectedMetrics.contains($0) && HealthKitManager.supportsBackgroundPush($0)
         }
