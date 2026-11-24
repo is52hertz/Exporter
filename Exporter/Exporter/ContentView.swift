@@ -178,16 +178,46 @@ struct ContentView: View {
                     Text(status)
                 }
                 if let receipt = model.settings.lastSendReceipt {
-                    switch receipt.destination {
-                    case .primary:
-                        Text("上次发送：主地址 · \(receipt.host)")
-                    case .backup:
-                        Text("上次发送：备用地址 · \(receipt.host)")
+                    VStack(alignment: .leading, spacing: 4) {
+                        Label {
+                            if let confirmedAt = receipt.confirmedAt {
+                                let time = Self.sendDateFormatter.string(from: confirmedAt)
+                                if receipt.origin == .background {
+                                    Text("上次送达 · \(time) · 后台")
+                                } else {
+                                    Text("上次送达 · \(time)")
+                                }
+                            } else {
+                                Text("上次送达")
+                            }
+                        } icon: {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundStyle(.green)
+                                .accessibilityHidden(true)
+                        }
+                        switch receipt.destination {
+                        case .primary:
+                            Text("主地址 · \(receipt.host)")
+                        case .backup:
+                            Text("备用地址 · \(receipt.host)")
+                        }
                     }
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityElement(children: .combine)
+                    .accessibilityIdentifier("home.lastSendReceipt")
                 }
             }
         }
     }
+
+    private static let sendDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = .autoupdatingCurrent
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        formatter.doesRelativeDateFormatting = true
+        return formatter
+    }()
 
     // MARK: 大导出确认弹层
 

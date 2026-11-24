@@ -12,10 +12,16 @@ final class BackgroundPush {
         let includeUUID: Bool
     }
 
+    nonisolated enum ResultNotice: Equatable, Sendable {
+        case success(sampleCount: Int, destination: SendReceipt.Destination)
+        case notConfirmed
+    }
+
     private let configuration: () -> Configuration?
     private let fetch: ([HealthMetric]) async throws -> HealthKitManager.FetchOutcome
     private let sender: (Configuration, POSTStartAuthorization) -> any ExportSender
     private let commit: (HealthKitManager.FetchOutcome, SendReceipt) -> Void
+    private let report: (ResultNotice) async -> Void
     private let device: ExportDocument.DeviceInfo
     private let batchingDelay: Duration
     private let logger = Logger(subsystem: "cn.Teethe.Exporter", category: "BackgroundPush")
@@ -27,12 +33,14 @@ final class BackgroundPush {
          fetch: @escaping ([HealthMetric]) async throws -> HealthKitManager.FetchOutcome,
          sender: @escaping (Configuration, POSTStartAuthorization) -> any ExportSender,
          commit: @escaping (HealthKitManager.FetchOutcome, SendReceipt) -> Void,
+         report: @escaping (ResultNotice) async -> Void = { _ in },
          device: ExportDocument.DeviceInfo,
          batchingDelay: Duration = .seconds(2)) {
         self.configuration = configuration
         self.fetch = fetch
         self.sender = sender
         self.commit = commit
+        self.report = report
         self.device = device
         self.batchingDelay = batchingDelay
     }
@@ -87,6 +95,7 @@ final class BackgroundPush {
             }
             let batch = pending
             pending.removeAll()
+            // Give the report its scheduling attempt before completing the HealthKit wakes.
             await push()
             batch.forEach { $0() }
         }
@@ -98,30 +107,52 @@ final class BackgroundPush {
         batch.forEach { $0() }
     }
 
+    private func isCurrent(_ config: Configuration, _ startAuthorization: POSTStartAuthorization) -> Bool {
+        !Task.isCancelled && activeStartAuthorization === startAuthorization && configuration() == config
+    }
+
+    private func isCancellation(_ error: Error) -> Bool {
+        error is CancellationError || (error as? URLError)?.code == .cancelled
+    }
+
     private func push() async {
         guard let config = configuration(), !Task.isCancelled else { return }
         let startAuthorization = POSTStartAuthorization()
         activeStartAuthorization = startAuthorization
         defer { activeStartAuthorization = nil }
+
+        let outcome: HealthKitManager.FetchOutcome
         do {
-            let outcome = try await fetch(config.metrics)
-            guard !outcome.samples.isEmpty, !Task.isCancelled,
-                  activeStartAuthorization === startAuthorization, configuration() == config else { return }
-            let device = self.device
-            let data = await Task.detached(priority: .utility) {
-                JSONExporter.encode(ExportDocument(
-                    samples: outcome.samples, device: device,
-                    range: .init(mode: .incremental, start: nil, end: nil),
-                    includeUUID: config.includeUUID))
-            }.value
-            guard !Task.isCancelled, activeStartAuthorization === startAuthorization, configuration() == config else { return }
-            let receipt = try await sender(config, startAuthorization).send(data)
-            guard !Task.isCancelled, activeStartAuthorization === startAuthorization, configuration() == config else { return }
-            commit(outcome, receipt)
-        } catch SenderError.unconfirmedDelivery {
-            if !Task.isCancelled { logger.error("Background push delivery was not confirmed; anchors were not advanced.") }
+            outcome = try await fetch(config.metrics)
         } catch {
-            if !Task.isCancelled { logger.error("Background push failed; anchors were not advanced.") }
+            if isCurrent(config, startAuthorization), !isCancellation(error) {
+                logger.error("Background push could not fetch samples; anchors were not advanced.")
+            }
+            return
         }
+        guard !outcome.samples.isEmpty, isCurrent(config, startAuthorization) else { return }
+
+        let device = self.device
+        let data = await Task.detached(priority: .utility) {
+            JSONExporter.encode(ExportDocument(
+                samples: outcome.samples, device: device,
+                range: .init(mode: .incremental, start: nil, end: nil),
+                includeUUID: config.includeUUID))
+        }.value
+        guard isCurrent(config, startAuthorization) else { return }
+
+        let receipt: SendReceipt
+        do {
+            receipt = try await sender(config, startAuthorization).send(data)
+        } catch {
+            guard isCurrent(config, startAuthorization), !isCancellation(error) else { return }
+            logger.error("Background push delivery was not confirmed; anchors were not advanced.")
+            await report(.notConfirmed)
+            return
+        }
+        guard isCurrent(config, startAuthorization) else { return }
+        commit(outcome, receipt)
+        guard isCurrent(config, startAuthorization) else { return }
+        await report(.success(sampleCount: outcome.samples.count, destination: receipt.destination))
     }
 }

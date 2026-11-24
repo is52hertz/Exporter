@@ -17,8 +17,24 @@ nonisolated protocol ExportSender: Sendable {
 
 nonisolated struct SendReceipt: Codable, Equatable, Sendable {
     enum Destination: String, Codable, Sendable { case primary, backup }
+    enum Origin: String, Codable, Sendable { case manual, background }
+
     let destination: Destination
     let host: String
+    // Older saved receipts have no confirmation time or origin.
+    let confirmedAt: Date?
+    let origin: Origin?
+
+    init(destination: Destination, host: String, confirmedAt: Date? = nil, origin: Origin? = nil) {
+        self.destination = destination
+        self.host = host
+        self.confirmedAt = confirmedAt
+        self.origin = origin
+    }
+
+    func dated(at date: Date, origin: Origin = .manual) -> Self {
+        Self(destination: destination, host: host, confirmedAt: date, origin: origin)
+    }
 }
 
 nonisolated enum SenderError: LocalizedError {

@@ -33,7 +33,10 @@ final class AppSettings {
 
     /// 三个字段共用一个观察及持久化快照，编辑副本不会通知发送方。
     private(set) var endpointDraft: EndpointDraft {
-        didSet { Self.persistEndpointDraft(endpointDraft, in: defaults) }
+        didSet {
+            Self.persistEndpointDraft(endpointDraft, in: defaults)
+            if endpointDraft != oldValue { resetBackgroundNotificationStreak() }
+        }
     }
 
     @discardableResult
@@ -79,13 +82,58 @@ final class AppSettings {
     }
 
     var backgroundPushEnabled: Bool {
-        didSet { defaults.set(backgroundPushEnabled, forKey: Keys.backgroundPushEnabled) }
+        didSet {
+            defaults.set(backgroundPushEnabled, forKey: Keys.backgroundPushEnabled)
+            if backgroundPushEnabled != oldValue { resetBackgroundNotificationStreak() }
+        }
+    }
+
+    enum BackgroundNotificationMode: String {
+        case off, failures, all
+    }
+
+    var backgroundNotificationMode: BackgroundNotificationMode {
+        didSet {
+            guard backgroundNotificationMode != oldValue else { return }
+            defaults.set(backgroundNotificationMode.rawValue, forKey: Keys.backgroundNotificationMode)
+            // Changing the success-only option must not restart an active failure streak.
+            successNotificationRevision = UUID()
+            if backgroundNotificationMode == .off || oldValue == .off {
+                resetBackgroundNotificationStreak()
+            }
+        }
+    }
+
+    // Local bookkeeping only. No payload, URL, or diagnostic text is stored here.
+    @ObservationIgnored private(set) var backgroundNotificationRevision = UUID()
+    @ObservationIgnored private(set) var successNotificationRevision = UUID()
+    @ObservationIgnored private var backgroundFailures: Int
+
+    /// 2 = eligible for a notice; 3 = this streak has already been reported.
+    func recordUnconfirmedBackgroundSend() -> Bool {
+        if backgroundFailures < 2 { saveBackgroundFailures(backgroundFailures + 1) }
+        return backgroundFailures == 2
+    }
+
+    func markBackgroundFailureNoticeScheduled() { saveBackgroundFailures(3) }
+    func clearBackgroundFailures() { saveBackgroundFailures(0) }
+
+    private func resetBackgroundNotificationStreak() {
+        backgroundNotificationRevision = UUID()
+        clearBackgroundFailures()
+    }
+
+    private func saveBackgroundFailures(_ count: Int) {
+        guard backgroundFailures != count else { return }
+        backgroundFailures = count
+        defaults.set(count, forKey: Keys.backgroundFailures)
     }
 
     /// 当前选中的指标集合。
     var selectedMetrics: Set<HealthMetric> {
         didSet {
             defaults.set(selectedMetrics.map(\.rawValue), forKey: Keys.selectedMetrics)
+            if selectedMetrics != oldValue { resetBackgroundNotificationStreak() }
         }
     }
 
@@ -112,7 +160,10 @@ final class AppSettings {
 
     /// 导出 JSON 是否包含每条样本的 HealthKit UUID（用于接收端精确去重；会显著增大文件，默认关）。
     var includeUUID: Bool {
-        didSet { defaults.set(includeUUID, forKey: Keys.includeUUID) }
+        didSet {
+            defaults.set(includeUUID, forKey: Keys.includeUUID)
+            if includeUUID != oldValue { resetBackgroundNotificationStreak() }
+        }
     }
 
     /// 是否已成功发起过一次授权请求。部分类型不出现在授权面板（地区/设备功能限制），
@@ -132,6 +183,9 @@ final class AppSettings {
             try? JSONDecoder().decode(SendReceipt.self, from: $0)
         }
         self.backgroundPushEnabled = defaults.bool(forKey: Keys.backgroundPushEnabled)
+        self.backgroundNotificationMode = defaults.string(forKey: Keys.backgroundNotificationMode)
+            .flatMap(BackgroundNotificationMode.init(rawValue:)) ?? .off
+        self.backgroundFailures = min(3, max(0, defaults.integer(forKey: Keys.backgroundFailures)))
 
         if let raw = defaults.array(forKey: Keys.selectedMetrics) as? [String] {
             self.selectedMetrics = Set(raw.compactMap(HealthMetric.init(rawValue:)))
@@ -190,6 +244,8 @@ final class AppSettings {
         static let lastSendReceipt = "settings.lastSendReceipt"
         static let authHeader = "settings.authHeader"
         static let backgroundPushEnabled = "settings.backgroundPushEnabled"
+        static let backgroundNotificationMode = "settings.backgroundNotificationMode"
+        static let backgroundFailures = "settings.backgroundFailures"
         static let selectedMetrics = "settings.selectedMetrics"
         static let lastSyncDate = "settings.lastSyncDate"
         static let thresholdDays = "settings.thresholdDays"
