@@ -48,7 +48,8 @@ struct BackgroundPushTests {
         fixture.notify()
         fixture.notify()
         await batch?.value
-        #expect(fixture.events == ["fetch", "send", "commit", "complete", "complete", "complete"])
+        #expect(fixture.events == ["fetch", "send", "commit", "attempt", "report", "complete", "complete", "complete"])
+        #expect(fixture.notices == [.success(sampleCount: 1, destination: .primary)])
         fixture.expectProgress(advanced: true, receipt: fixture.receipt)
     }
 
@@ -56,25 +57,51 @@ struct BackgroundPushTests {
         let fixture = try Fixture()
         fixture.setBackup("http://192.168.1.2/health")
         fixture.receipt = .init(destination: .backup, host: "192.168.1.2")
+        let startedAt = Date()
         await fixture.notify()?.value
-        #expect(fixture.events == ["fetch", "send", "commit", "complete"])
+        #expect(fixture.events == ["fetch", "send", "commit", "attempt", "report", "complete"])
+        #expect(fixture.notices == [.success(sampleCount: 1, destination: .backup)])
         fixture.expectProgress(advanced: true, receipt: fixture.receipt)
+        let restarted = try fixture.restartSettings()
+        let attempt = try #require(restarted.lastSendAttempt)
+        #expect(restarted.backgroundNotificationMode == .off)
+        #expect(attempt.origin == .background)
+        #expect(attempt.outcome == .success(sampleCount: 1, destination: .backup))
+        #expect(startedAt <= attempt.date && attempt.date <= Date())
+        #expect(attempt.confirmedHost(from: restarted.lastSendReceipt) == "192.168.1.2")
     }
 
-    @Test(arguments: [SenderError.httpStatus(500, body: nil), .unconfirmedDelivery])
-    func failedSendKeepsAnchorsAndReceiptForNextWake(error: SenderError) async throws {
+    @Test(arguments: [false, true])
+    func failedSendKeepsAnchorsAndReceiptForNextWake(unconfirmed: Bool) async throws {
         let fixture = try Fixture()
         fixture.setBackup("https://backup.example.test/health")
         let previous = SendReceipt(destination: .backup, host: "previous.example.test")
+            .dated(at: Date(timeIntervalSince1970: 123), origin: .manual)
         fixture.settings.lastSendReceipt = previous
-        fixture.sendError = error
+        fixture.settings.lastSendAttempt = SendAttempt(date: try #require(previous.confirmedAt), origin: .manual,
+                                                       outcome: .success(sampleCount: 4, destination: .backup))
+        fixture.sendError = unconfirmed
+            ? SenderError.unconfirmedDelivery
+            : SenderError.httpStatus(500, body: "private server response")
+        let startedAt = Date()
         await fixture.notify()?.value
-        #expect(fixture.events == ["fetch", "send", "complete"])
+        #expect(fixture.events == ["fetch", "send", "attempt", "report", "complete"])
+        #expect(fixture.notices == [.notConfirmed])
         fixture.expectProgress(advanced: false, receipt: previous)
+        let restarted = try fixture.restartSettings()
+        let latest = try #require(restarted.lastSendAttempt)
+        #expect(restarted.backgroundNotificationMode == .off)
+        #expect(restarted.lastSendReceipt == previous)
+        #expect(latest.origin == .background)
+        #expect(latest.outcome == (unconfirmed ? .deliveryUnconfirmed : .failure(httpStatus: 500)))
+        #expect(startedAt <= latest.date && latest.date <= Date())
+        #expect(latest.confirmedHost(from: previous) == nil)
 
         fixture.sendError = nil
         await fixture.notify()?.value
-        #expect(fixture.events == ["fetch", "send", "complete", "fetch", "send", "commit", "complete"])
+        #expect(fixture.events == ["fetch", "send", "attempt", "report", "complete",
+                                   "fetch", "send", "commit", "attempt", "report", "complete"])
+        #expect(fixture.notices == [.notConfirmed, .success(sampleCount: 1, destination: .primary)])
         fixture.expectProgress(advanced: true, receipt: fixture.receipt)
     }
 
@@ -83,6 +110,16 @@ struct BackgroundPushTests {
         fixture.hasSamples = false
         await fixture.notify()?.value
         #expect(fixture.events == ["fetch", "complete"])
+        #expect(fixture.notices.isEmpty)
+    }
+
+    @Test func fetchErrorIsNotReportedAsSendFailure() async throws {
+        let fixture = try Fixture()
+        fixture.fetchError = URLError(.timedOut)
+        await fixture.notify()?.value
+        #expect(fixture.events == ["fetch", "complete"])
+        #expect(fixture.notices.isEmpty)
+        fixture.expectProgress(advanced: false, receipt: nil)
     }
 
     @Test func disablingDuringFetchDoesNotSendOrCommit() async throws {
@@ -123,6 +160,53 @@ struct BackgroundPushTests {
         fixture.expectProgress(advanced: false, receipt: nil)
     }
 
+    @Test(arguments: [false, true])
+    func senderCancellationErrorDoesNotReport(urlCancellation: Bool) async throws {
+        let fixture = try Fixture()
+        fixture.sendError = urlCancellation ? URLError(.cancelled) : CancellationError()
+        await fixture.notify()?.value
+        #expect(fixture.events == ["fetch", "send", "complete"])
+        #expect(fixture.notices.isEmpty)
+        fixture.expectProgress(advanced: false, receipt: nil)
+    }
+
+    @Test func cancelDuringSendDiscardsAmbiguousFailure() async throws {
+        let fixture = try Fixture()
+        fixture.onSend = { [unowned fixture] in fixture.push.cancel() }
+        fixture.sendError = SenderError.unconfirmedDelivery
+        await fixture.notify()?.value
+        #expect(fixture.events == ["fetch", "send", "complete"])
+        #expect(fixture.notices.isEmpty)
+        fixture.expectProgress(advanced: false, receipt: nil)
+    }
+
+    @Test func revokedSendFailureDoesNotReportEvenIfConfigurationMatchesAgain() async throws {
+        let fixture = try Fixture()
+        fixture.useSavedSettings()
+        let original = fixture.savedConfiguration
+        #expect(original != nil)
+        let previous = SendAttempt(date: Date(timeIntervalSince1970: 123), origin: .manual,
+                                   outcome: .failure(httpStatus: nil))
+        fixture.settings.lastSendAttempt = previous
+        fixture.primaryPOSTOutcome = .failure(URLError(.timedOut), .init())
+        fixture.duringPrimaryPOST = { [unowned fixture] in
+            // Restore the same settings without running the deferred cancel. The original
+            // authorization identity is still revoked and that result must stay silent.
+            fixture.settings.backgroundPushEnabled = false
+            fixture.settings.backgroundPushEnabled = true
+            #expect(fixture.savedConfiguration == original)
+        }
+
+        await fixture.notify()?.value
+
+        #expect(fixture.postHosts == ["example.test"])
+        #expect(fixture.events == ["fetch", "complete"])
+        #expect(fixture.notices.isEmpty)
+        let restarted = try fixture.restartSettings()
+        #expect(restarted.lastSendAttempt == previous)
+        fixture.expectProgress(advanced: false, receipt: nil)
+    }
+
     @Test func pendingEndpointDraftIsInvisibleToBackgroundNotification() async throws {
         let fixture = try Fixture()
         fixture.useSavedSettings()
@@ -135,6 +219,7 @@ struct BackgroundPushTests {
 
         #expect(fixture.postHosts == ["example.test", "saved.example.test"])
         #expect(fixture.postAuthorization == ["Bearer saved-fixture", "Bearer saved-fixture"])
+        #expect(fixture.notices == [.success(sampleCount: 1, destination: .backup)])
         fixture.expectProgress(advanced: true, receipt: .init(destination: .backup, host: "saved.example.test"))
         #expect(fixture.settings.endpointDraft != draft)
     }
@@ -171,16 +256,20 @@ struct BackgroundPushTests {
         let settings: AppSettings
         var configuration: BackgroundPush.Configuration?
         var events: [String] = []
+        var notices: [BackgroundPush.ResultNotice] = []
         var hasSamples = true
-        var sendError: SenderError?
+        var fetchError: (any Error)?
+        var sendError: (any Error)?
         var receipt: SendReceipt = .init(destination: .primary, host: "example.test")
         var onFetch: (() -> Void)?
         var onSend: (() -> Void)?
         var duringPrimaryPOST: (() -> Void)?
+        var primaryPOSTOutcome: POSTOutcome?
         var postHosts: [String] = []
         var postAuthorization: [String] = []
         private var usesSavedSettings = false
         private lazy var delivery = BackgroundDelivery(settings: settings, health: HealthKitManager())
+        var savedConfiguration: BackgroundPush.Configuration? { delivery.currentConfiguration() }
 
         func useSavedSettings() {
             usesSavedSettings = true
@@ -204,6 +293,7 @@ struct BackgroundPushTests {
                 // Revoke or replace settings while the primary is in flight, before returning
                 // a failure which otherwise authorizes a backup attempt.
                 duringPrimaryPOST?()
+                if let primaryPOSTOutcome { return primaryPOSTOutcome }
                 let evidence = POSTAttemptSummary(metricsReports: [.init(transactions: [.init(fetchType: .networkLoad)])])
                 return .failure(URLError(.cannotConnectToHost), evidence)
             }
@@ -230,11 +320,20 @@ struct BackgroundPushTests {
                                   backupEndpoint: backupEndpoint, authorizationHeader: "", includeUUID: true)
         }
 
+        func restartSettings() throws -> AppSettings {
+            AppSettings(defaults: try #require(UserDefaults(suiteName: suite)))
+        }
+
         func expectProgress(advanced: Bool, receipt: SendReceipt?) {
             #expect(manual.anchor(for: metric) == HKQueryAnchor(fromValue: 3))
             #expect(background.anchor(for: metric) == HKQueryAnchor(fromValue: advanced ? 7 : 5))
-            #expect(settings.lastSendReceipt == receipt)
-            #expect(AppSettings(defaults: defaults).lastSendReceipt == receipt)
+            let expected: SendReceipt? = if advanced, let receipt, let date = settings.lastSendAttempt?.date {
+                receipt.dated(at: date, origin: .background)
+            } else {
+                receipt
+            }
+            #expect(settings.lastSendReceipt == expected)
+            #expect(AppSettings(defaults: defaults).lastSendReceipt == expected)
         }
 
         lazy var push = BackgroundPush(
@@ -243,6 +342,7 @@ struct BackgroundPushTests {
                 #expect(metrics == [metric])
                 events.append("fetch")
                 onFetch?()
+                if let fetchError { throw fetchError }
                 let now = Date(timeIntervalSince1970: 1_700_000_000)
                 let sample = HealthSample(type: metric.rawValue, category: metric.category.rawValue, value: 42,
                                           stringValue: nil, unit: "count", start: now, end: now,
@@ -273,6 +373,14 @@ struct BackgroundPushTests {
                 }
                 settings.lastSendReceipt = receipt
                 events.append("commit")
+            },
+            recordAttempt: { [unowned self] attempt in
+                settings.lastSendAttempt = attempt
+                events.append("attempt")
+            },
+            report: { [unowned self] notice in
+                notices.append(notice)
+                events.append("report")
             },
             device: .init(model: "Simulator", os: "iOS"),
             batchingDelay: .zero)

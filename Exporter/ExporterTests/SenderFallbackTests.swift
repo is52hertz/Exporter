@@ -77,8 +77,9 @@ struct SenderFallbackTests {
         #expect(fixture.hosts == ["primary.test", "backup.test", "primary.test"])
     }
 
-    @Test func blankBackupPreservesLegacyPathAndError() async throws {
-        let fixture = Fixture(backupEndpoint: " \n\t ", primaryFailure: .timedOut, summary: Self.preHTTP)
+    @Test(arguments: ["", " \n\t "])
+    func noBackupPreservesProvenPreconnectErrorAndDefaultTimeout(_ backupEndpoint: String) async throws {
+        let fixture = Fixture(backupEndpoint: backupEndpoint, primaryFailure: .timedOut, summary: Self.preHTTP)
         do {
             _ = try await fixture.send()
             Issue.record("Expected original URLSession error")
@@ -104,16 +105,18 @@ struct SenderFallbackTests {
         }
     }
 
-    @Test(arguments: [URLError.Code.timedOut, .networkConnectionLost, .cannotConnectToHost,
-                      .dnsLookupFailed, .serverCertificateUntrusted])
-    func missingMetricsFailsClosed(_ code: URLError.Code) async {
-        let fixture = Fixture(primaryFailure: code)
+    @Test(arguments: [URLError.Code.timedOut, .networkConnectionLost, .cancelled, .cannotConnectToHost,
+                      .dnsLookupFailed, .serverCertificateUntrusted],
+          ["", "https://backup.test/hook"])
+    func missingMetricsFailsClosed(_ code: URLError.Code, backupEndpoint: String) async {
+        let fixture = Fixture(backupEndpoint: backupEndpoint, primaryFailure: code)
         await expectUnconfirmed(fixture)
     }
 
-    @Test func requestHeadersAloneBlockFallbackEvenWithZeroBodyBytes() async {
+    @Test(arguments: [URLError.Code.timedOut, .networkConnectionLost], ["", "https://backup.test/hook"])
+    func requestHeadersAloneMakeDeliveryUnconfirmed(_ code: URLError.Code, backupEndpoint: String) async {
         let tx = POSTAttemptSummary.Transaction(fetchType: .networkLoad, requestHeaderBytes: 17)
-        await expectUnconfirmed(Fixture(primaryFailure: .timedOut, summary: Self.metrics([tx])))
+        await expectUnconfirmed(Fixture(backupEndpoint: backupEndpoint, primaryFailure: code, summary: Self.metrics([tx])))
     }
 
     @Test func allTransactionsMayProveFreshIncompleteNetworkLoads() async throws {
@@ -202,24 +205,28 @@ struct SenderFallbackTests {
         }
     }
 
-    @Test func onlyFinalHTTPStatusIsHonoredEvenIfResponseBodyTimesOut() async throws {
+    @Test(arguments: ["", "https://backup.test/hook"])
+    func onlyFinalHTTPStatusIsHonoredEvenIfResponseBodyTimesOut(_ backupEndpoint: String) async throws {
         let earlier = try Self.transaction(responseStatus: 401)
         let final = try Self.transaction(responseStatus: 307)
-        let fixture = Fixture(primaryFailure: .timedOut, summary: Self.metrics([earlier, final]))
+        let fixture = Fixture(backupEndpoint: backupEndpoint, primaryFailure: .timedOut, summary: Self.metrics([earlier, final]))
         do {
             _ = try await fixture.send()
             Issue.record("Expected known HTTP status")
-        } catch SenderError.httpStatus(let status, _) {
+        } catch SenderError.httpStatus(let status, let body) {
             #expect(status == 307)
+            #expect(body == nil)
             #expect(fixture.hosts == ["primary.test"])
         } catch {
             Issue.record("Unexpected error: \(error)")
         }
     }
 
-    @Test func successfulStatusWithInterruptedBodyReportsStatusWithoutReceiptOrFallback() async throws {
-        let final = try Self.transaction(responseStatus: 201)
-        let fixture = Fixture(primaryFailure: .timedOut, summary: Self.metrics([final]))
+    @Test(arguments: ["", "https://backup.test/hook"])
+    func successfulStatusWithInterruptedBodyReportsStatusWithoutReceiptOrRetry(_ backupEndpoint: String) async throws {
+        var final = try Self.transaction(responseStatus: 201)
+        final.responseBodyBytes = 1
+        let fixture = Fixture(backupEndpoint: backupEndpoint, primaryFailure: .timedOut, summary: Self.metrics([final]))
         do {
             _ = try await fixture.send()
             Issue.record("An incomplete response must not produce a receipt")
@@ -263,9 +270,10 @@ struct SenderFallbackTests {
         #expect(called)
     }
 
-    @Test func revokedAuthorizationPreventsPrimaryAttempt() async {
+    @Test(arguments: ["", "https://backup.test/hook"])
+    func revokedAuthorizationPreventsPrimaryAttempt(_ backupEndpoint: String) async {
         let authorization = POSTStartAuthorization()
-        let fixture = Fixture(startAuthorization: authorization)
+        let fixture = Fixture(backupEndpoint: backupEndpoint, startAuthorization: authorization)
         authorization.invalidate()
         do {
             _ = try await fixture.send()
@@ -321,15 +329,16 @@ struct SenderFallbackTests {
         }
     }
 
-    @Test func cancellationAfterPossibleSendIsUnconfirmedAndDoesNotFallback() async {
-        let fixture = Fixture()
+    @Test(arguments: ["", "https://backup.test/hook"])
+    func cancellationAfterPossibleSendIsUnconfirmedAndDoesNotRetry(_ backupEndpoint: String) async {
+        let fixture = Fixture(backupEndpoint: backupEndpoint)
         let (started, signal) = AsyncStream<Void>.makeStream()
         let task = Task {
             try await fixture.sender.send(Fixture.payload) { request, session in
                 fixture.record(request, session)
                 signal.yield(())
                 try? await Task.sleep(for: .seconds(3600))
-                return .failure(URLError(.cancelled), POSTAttemptSummary())
+                return .failure(URLError(.cancelled), POSTAttemptSummary(sentBodyProgress: true))
             }
         }
         var iterator = started.makeAsyncIterator()
@@ -386,7 +395,7 @@ struct SenderFallbackTests {
     private func expectUnconfirmed(_ fixture: Fixture) async {
         do {
             _ = try await fixture.send()
-            Issue.record("An unconfirmed primary POST must not send to backup")
+            Issue.record("Expected unconfirmed delivery after exactly one primary POST attempt")
         } catch SenderError.unconfirmedDelivery {
             #expect(fixture.hosts == ["primary.test"])
         } catch {

@@ -15,9 +15,14 @@ import UIKit
 final class ExportModel {
     let settings: AppSettings
     let health: HealthKitManager
+    private let manualSender: (any ExportSender)?
 
     // 导出产物（大数据落盘，仅轻量摘要驻留内存，避免巨型字符串卡渲染）
-    var exportFileURL: URL?
+    var exportFileURL: URL? {
+        didSet {
+            if exportFileURL != oldValue { clearManualSendFeedback() }
+        }
+    }
     var exportByteCount = 0
     var previewSnippet = ""
     var previewTruncated = false
@@ -29,7 +34,36 @@ final class ExportModel {
     var isWorking = false
     var statusMessage: String?
     var errorMessage: String?
-    var showPreview = false
+    var showPreview = false {
+        didSet {
+            if oldValue && !showPreview {
+                // 预览关闭后不把已经呈现的发送错误转交给首页重复弹窗。
+                if let outcome = manualSendOutcome {
+                    switch outcome.result {
+                    case .success: break
+                    case .deliveryUnconfirmed, .failure: errorMessage = nil
+                    }
+                }
+                clearManualSendFeedback()
+            }
+        }
+    }
+
+    // 预览反馈只属于当前手动发送，不从首页保存的收据恢复。
+    private(set) var isSending = false
+    private(set) var manualSendOutcome: ManualSendOutcome?
+    private var manualFeedbackAttemptID: UUID?
+
+    struct ManualSendOutcome {
+        enum Result: Equatable {
+            case success(sampleCount: Int, destination: SendReceipt.Destination)
+            case deliveryUnconfirmed
+            case failure
+        }
+
+        let id: UUID
+        let result: Result
+    }
 
     // 授权
     var authorizationDetermined = false
@@ -66,14 +100,14 @@ final class ExportModel {
         }
     }
 
-    init() {
-        self.settings = AppSettings()
-        self.health = HealthKitManager()
+    convenience init() {
+        self.init(settings: AppSettings(), health: HealthKitManager())
     }
 
-    init(settings: AppSettings, health: HealthKitManager) {
+    init(settings: AppSettings, health: HealthKitManager, manualSender: (any ExportSender)? = nil) {
         self.settings = settings
         self.health = health
+        self.manualSender = manualSender
     }
 
     var canRead: Bool { !settings.selectedMetrics.isEmpty }
@@ -188,6 +222,7 @@ final class ExportModel {
             errorMessage = "请至少选择一个指标。"
             return
         }
+        clearManualSendFeedback()
         errorMessage = nil
         let threshold = TimeInterval(settings.largeExportThresholdDays) * 86_400
         let span = exportSpanSeconds()           // nil = 全部历史
@@ -444,8 +479,14 @@ final class ExportModel {
 
     // MARK: 发送
 
+    private func clearManualSendFeedback() {
+        manualFeedbackAttemptID = nil
+        manualSendOutcome = nil
+    }
+
     func send() async {
-        guard !isWorking else { return }
+        guard showPreview, !isWorking, !Task.isCancelled else { return }
+        clearManualSendFeedback()
         guard settings.hasEndpoint else {
             errorMessage = "未配置 API endpoint，可在设置中填写，或使用分享导出。"
             return
@@ -455,26 +496,45 @@ final class ExportModel {
             return
         }
         errorMessage = nil
+        let sentSampleCount = sampleCount
+        let attemptID = UUID()
+        manualFeedbackAttemptID = attemptID
         isWorking = true
-        defer { isWorking = false }
+        isSending = true
+        defer {
+            manualFeedbackAttemptID = nil
+            isSending = false
+            isWorking = false
+        }
+        var transportInvoked = false
         do {
-            let sender = HTTPSender(endpoint: settings.endpoint,
-                                    backupEndpoint: settings.backupEndpoint,
-                                    authorizationHeader: settings.authorizationHeader)
+            let sender = manualSender ?? HTTPSender(endpoint: settings.endpoint,
+                                                    backupEndpoint: settings.backupEndpoint,
+                                                    authorizationHeader: settings.authorizationHeader)
             let data = try await Task.detached(priority: .userInitiated) {
                 try Data(contentsOf: fileURL)
             }.value
-            let receipt = try await sender.send(data)
+            guard !data.isEmpty, !Task.isCancelled else { return }
+            transportInvoked = true
+            let resultReceipt = try await sender.send(data)
+            let date = Date()
+            let receipt = resultReceipt.dated(at: date)
             settings.lastSendReceipt = receipt
-            switch receipt.destination {
-            case .primary:
-                statusMessage = sender.backupEndpoint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    ? "已发送 \(sampleCount) 条样本。"
-                    : "已发送 \(sampleCount) 条样本（主地址）。"
-            case .backup:
-                statusMessage = "主地址连不上，已改发备用地址：\(sampleCount) 条样本。"
-            }
+            settings.lastSendAttempt = SendAttempt(date: date, origin: .manual,
+                                                   outcome: .success(sampleCount: sentSampleCount, destination: receipt.destination))
+            guard manualFeedbackAttemptID == attemptID, !Task.isCancelled else { return }
+            manualSendOutcome = ManualSendOutcome(
+                id: attemptID, result: .success(sampleCount: sentSampleCount, destination: receipt.destination)
+            )
         } catch {
+            let outcome = transportInvoked ? SendAttempt.Outcome(sendError: error) : nil
+            if let outcome {
+                settings.lastSendAttempt = SendAttempt(date: Date(), origin: .manual, outcome: outcome)
+            }
+            guard manualFeedbackAttemptID == attemptID, !Task.isCancelled,
+                  !(error is CancellationError), (error as? URLError)?.code != .cancelled else { return }
+            let result: ManualSendOutcome.Result = outcome == .deliveryUnconfirmed ? .deliveryUnconfirmed : .failure
+            manualSendOutcome = ManualSendOutcome(id: attemptID, result: result)
             errorMessage = error.localizedDescription
         }
     }

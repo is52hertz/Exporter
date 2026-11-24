@@ -17,8 +17,24 @@ nonisolated protocol ExportSender: Sendable {
 
 nonisolated struct SendReceipt: Codable, Equatable, Sendable {
     enum Destination: String, Codable, Sendable { case primary, backup }
+    enum Origin: String, Codable, Sendable { case manual, background }
+
     let destination: Destination
     let host: String
+    // Older saved receipts have no confirmation time or origin.
+    let confirmedAt: Date?
+    let origin: Origin?
+
+    init(destination: Destination, host: String, confirmedAt: Date? = nil, origin: Origin? = nil) {
+        self.destination = destination
+        self.host = host
+        self.confirmedAt = confirmedAt
+        self.origin = origin
+    }
+
+    func dated(at date: Date, origin: Origin = .manual) -> Self {
+        Self(destination: destination, host: host, confirmedAt: date, origin: origin)
+    }
 }
 
 nonisolated enum SenderError: LocalizedError {
@@ -169,9 +185,9 @@ nonisolated struct HTTPSender: ExportSender {
             }
             try Task.checkCancellation()
             let backupOutcome = await attempt(request(for: backupURL, data: data), backupSession)
-            return try Self.finish(backupOutcome, at: backupURL, destination: .backup, legacyErrors: false)
+            return try Self.finish(backupOutcome, at: backupURL, destination: .backup)
         }
-        return try Self.finish(primaryOutcome, at: primary, destination: .primary, legacyErrors: backupURL == nil)
+        return try Self.finish(primaryOutcome, at: primary, destination: .primary)
     }
 
     private func request(for url: URL, data: Data, shortIdleTimeout: Bool = false) -> URLRequest {
@@ -214,8 +230,7 @@ nonisolated struct HTTPSender: ExportSender {
         }
     }
 
-    private static func finish(_ outcome: POSTOutcome, at url: URL, destination: SendReceipt.Destination,
-                               legacyErrors: Bool) throws -> SendReceipt {
+    private static func finish(_ outcome: POSTOutcome, at url: URL, destination: SendReceipt.Destination) throws -> SendReceipt {
         switch outcome {
         case .notStarted:
             throw CancellationError()
@@ -226,7 +241,6 @@ nonisolated struct HTTPSender: ExportSender {
             }
             return SendReceipt(destination: destination, host: unbracketedHost(url.host ?? ""))
         case .failure(let error, let evidence):
-            if legacyErrors { throw error }
             if let status = evidence.finalHTTPStatus {
                 if (200...299).contains(status) { throw SenderError.interruptedSuccessResponse(status) }
                 throw SenderError.httpStatus(status, body: nil)

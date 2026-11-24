@@ -6,6 +6,7 @@ import UIKit
 final class BackgroundDelivery {
     private let settings: AppSettings
     private let health: HealthKitManager
+    private let notifications: BackgroundSendNotifications
     private let defaults = UserDefaults.standard
     private let registrationKey = "backgroundDelivery.metrics"
     private let logger = Logger(subsystem: "cn.Teethe.Exporter", category: "BackgroundDelivery")
@@ -30,6 +31,8 @@ final class BackgroundDelivery {
             health.commit(outcome, background: true)
             settings.lastSendReceipt = receipt
         },
+        recordAttempt: { [settings] attempt in settings.lastSendAttempt = attempt },
+        report: { [notifications] result in await notifications.report(result) },
         device: .init(model: UIDevice.current.model,
                       os: "\(UIDevice.current.systemName) \(UIDevice.current.systemVersion)"))
 
@@ -45,6 +48,7 @@ final class BackgroundDelivery {
     init(settings: AppSettings, health: HealthKitManager) {
         self.settings = settings
         self.health = health
+        self.notifications = BackgroundSendNotifications(settings: settings)
         registrations = Set((defaults.stringArray(forKey: registrationKey) ?? []).compactMap(HealthMetric.init(rawValue:)))
     }
 

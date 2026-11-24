@@ -33,7 +33,10 @@ final class AppSettings {
 
     /// 三个字段共用一个观察及持久化快照，编辑副本不会通知发送方。
     private(set) var endpointDraft: EndpointDraft {
-        didSet { Self.persistEndpointDraft(endpointDraft, in: defaults) }
+        didSet {
+            if endpointDraft != oldValue { resetBackgroundNotificationStreak() }
+            Self.persistEndpointDraft(endpointDraft, in: defaults)
+        }
     }
 
     @discardableResult
@@ -72,6 +75,13 @@ final class AppSettings {
         }
     }
 
+    var lastSendAttempt: SendAttempt? {
+        didSet {
+            let stored = lastSendAttempt.flatMap { try? JSONEncoder().encode($0) }
+            defaults.set(stored, forKey: Keys.lastSendAttempt)
+        }
+    }
+
     /// 可选 Authorization 头的值，如 "Bearer xxx"。
     var authorizationHeader: String {
         get { endpointDraft.authorizationHeader }
@@ -79,12 +89,88 @@ final class AppSettings {
     }
 
     var backgroundPushEnabled: Bool {
-        didSet { defaults.set(backgroundPushEnabled, forKey: Keys.backgroundPushEnabled) }
+        didSet {
+            guard backgroundPushEnabled != oldValue else { return }
+            if backgroundPushEnabled {
+                saveBackgroundFailures(0)
+            } else {
+                resetBackgroundNotificationStreak()
+            }
+            defaults.set(backgroundPushEnabled, forKey: Keys.backgroundPushEnabled)
+        }
+    }
+
+    enum BackgroundNotificationMode: String {
+        case off, failures, all
+    }
+
+    enum BackgroundNoticeKind: String, CaseIterable {
+        case success, failure
+    }
+
+    var backgroundNotificationMode: BackgroundNotificationMode {
+        didSet {
+            guard backgroundNotificationMode != oldValue else { return }
+            if backgroundNotificationMode == .off {
+                resetBackgroundNotificationStreak()
+            } else if oldValue == .off {
+                saveBackgroundFailures(0)
+            } else if backgroundNotificationMode == .failures {
+                // Success-only opt-out must not reset or revoke an active failure streak.
+                revokeBackgroundNotices([.success])
+            }
+            defaults.set(backgroundNotificationMode.rawValue, forKey: Keys.backgroundNotificationMode)
+        }
+    }
+
+    // Persist only opaque generations, so an eligible notice can still present after relaunch.
+    @ObservationIgnored private var backgroundNoticeRevisions: [String: String]
+    @ObservationIgnored private var backgroundFailures: Int
+    @ObservationIgnored var onBackgroundNoticeRevoked: (@MainActor (BackgroundNoticeKind) -> Void)?
+
+    func backgroundNoticeRevision(for kind: BackgroundNoticeKind) -> String? {
+        guard backgroundPushEnabled, backgroundNotificationMode != .off,
+              kind != .success || backgroundNotificationMode == .all else { return nil }
+        return backgroundNoticeRevisions[kind.rawValue]
+    }
+
+    /// 2 = eligible for a notice; 3 = this streak has already been reported.
+    var backgroundFailureNoticeIsEligible: Bool { backgroundFailures == 2 }
+
+    func recordUnconfirmedBackgroundSend() -> Bool {
+        if backgroundFailures < 2 { saveBackgroundFailures(backgroundFailures + 1) }
+        return backgroundFailureNoticeIsEligible
+    }
+
+    func markBackgroundFailureNoticeScheduled() { saveBackgroundFailures(3) }
+
+    func clearBackgroundFailures() {
+        revokeBackgroundNotices([.failure])
+        saveBackgroundFailures(0)
+    }
+
+    func revokeBackgroundNotices(_ kinds: [BackgroundNoticeKind]) {
+        for kind in kinds { backgroundNoticeRevisions[kind.rawValue] = UUID().uuidString }
+        defaults.set(backgroundNoticeRevisions, forKey: Keys.backgroundNoticeRevisions)
+        // Invalidate all relevant generations before issuing best-effort OS removal.
+        for kind in kinds { onBackgroundNoticeRevoked?(kind) }
+    }
+
+    private func resetBackgroundNotificationStreak() {
+        revokeBackgroundNotices(BackgroundNoticeKind.allCases)
+        saveBackgroundFailures(0)
+    }
+
+    private func saveBackgroundFailures(_ count: Int) {
+        guard backgroundFailures != count else { return }
+        backgroundFailures = count
+        defaults.set(count, forKey: Keys.backgroundFailures)
     }
 
     /// 当前选中的指标集合。
     var selectedMetrics: Set<HealthMetric> {
         didSet {
+            if selectedMetrics != oldValue { resetBackgroundNotificationStreak() }
             defaults.set(selectedMetrics.map(\.rawValue), forKey: Keys.selectedMetrics)
         }
     }
@@ -112,7 +198,10 @@ final class AppSettings {
 
     /// 导出 JSON 是否包含每条样本的 HealthKit UUID（用于接收端精确去重；会显著增大文件，默认关）。
     var includeUUID: Bool {
-        didSet { defaults.set(includeUUID, forKey: Keys.includeUUID) }
+        didSet {
+            if includeUUID != oldValue { resetBackgroundNotificationStreak() }
+            defaults.set(includeUUID, forKey: Keys.includeUUID)
+        }
     }
 
     /// 是否已成功发起过一次授权请求。部分类型不出现在授权面板（地区/设备功能限制），
@@ -131,7 +220,14 @@ final class AppSettings {
         self.lastSendReceipt = defaults.data(forKey: Keys.lastSendReceipt).flatMap {
             try? JSONDecoder().decode(SendReceipt.self, from: $0)
         }
+        self.lastSendAttempt = defaults.data(forKey: Keys.lastSendAttempt).flatMap {
+            try? JSONDecoder().decode(SendAttempt.self, from: $0)
+        }
+        self.backgroundNoticeRevisions = Self.loadBackgroundNoticeRevisions(from: defaults)
         self.backgroundPushEnabled = defaults.bool(forKey: Keys.backgroundPushEnabled)
+        self.backgroundNotificationMode = defaults.string(forKey: Keys.backgroundNotificationMode)
+            .flatMap(BackgroundNotificationMode.init(rawValue:)) ?? .off
+        self.backgroundFailures = min(3, max(0, defaults.integer(forKey: Keys.backgroundFailures)))
 
         if let raw = defaults.array(forKey: Keys.selectedMetrics) as? [String] {
             self.selectedMetrics = Set(raw.compactMap(HealthMetric.init(rawValue:)))
@@ -154,6 +250,15 @@ final class AppSettings {
         } ?? 3
         self.includeUUID = defaults.object(forKey: Keys.includeUUID) as? Bool ?? false
         self.hasRequestedAuthorization = defaults.bool(forKey: Keys.hasRequestedAuth)
+    }
+
+    private static func loadBackgroundNoticeRevisions(from defaults: UserDefaults) -> [String: String] {
+        let stored = defaults.dictionary(forKey: Keys.backgroundNoticeRevisions) as? [String: String] ?? [:]
+        let revisions = Dictionary(uniqueKeysWithValues: BackgroundNoticeKind.allCases.map { kind in
+            (kind.rawValue, stored[kind.rawValue].flatMap(UUID.init(uuidString:))?.uuidString ?? UUID().uuidString)
+        })
+        if revisions != stored { defaults.set(revisions, forKey: Keys.backgroundNoticeRevisions) }
+        return revisions
     }
 
     private static func loadEndpointDraft(from defaults: UserDefaults) -> EndpointDraft {
@@ -188,8 +293,12 @@ final class AppSettings {
         static let endpoint = "settings.endpoint"
         static let backupEndpoint = "settings.backupEndpoint"
         static let lastSendReceipt = "settings.lastSendReceipt"
+        static let lastSendAttempt = "settings.lastSendAttempt.v1"
         static let authHeader = "settings.authHeader"
         static let backgroundPushEnabled = "settings.backgroundPushEnabled"
+        static let backgroundNotificationMode = "settings.backgroundNotificationMode"
+        static let backgroundFailures = "settings.backgroundFailures"
+        static let backgroundNoticeRevisions = "settings.backgroundNoticeRevisions.v1"
         static let selectedMetrics = "settings.selectedMetrics"
         static let lastSyncDate = "settings.lastSyncDate"
         static let thresholdDays = "settings.thresholdDays"
