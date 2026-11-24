@@ -506,6 +506,7 @@ final class ExportModel {
             isSending = false
             isWorking = false
         }
+        var transportInvoked = false
         do {
             let sender = manualSender ?? HTTPSender(endpoint: settings.endpoint,
                                                     backupEndpoint: settings.backupEndpoint,
@@ -513,21 +514,26 @@ final class ExportModel {
             let data = try await Task.detached(priority: .userInitiated) {
                 try Data(contentsOf: fileURL)
             }.value
+            guard !data.isEmpty, !Task.isCancelled else { return }
+            transportInvoked = true
             let resultReceipt = try await sender.send(data)
-            let receipt = resultReceipt.dated(at: Date())
+            let date = Date()
+            let receipt = resultReceipt.dated(at: date)
             settings.lastSendReceipt = receipt
+            settings.lastSendAttempt = SendAttempt(date: date, origin: .manual,
+                                                   outcome: .success(sampleCount: sentSampleCount, destination: receipt.destination))
             guard manualFeedbackAttemptID == attemptID, !Task.isCancelled else { return }
             manualSendOutcome = ManualSendOutcome(
                 id: attemptID, result: .success(sampleCount: sentSampleCount, destination: receipt.destination)
             )
         } catch {
+            let outcome = transportInvoked ? SendAttempt.Outcome(sendError: error) : nil
+            if let outcome {
+                settings.lastSendAttempt = SendAttempt(date: Date(), origin: .manual, outcome: outcome)
+            }
             guard manualFeedbackAttemptID == attemptID, !Task.isCancelled,
                   !(error is CancellationError), (error as? URLError)?.code != .cancelled else { return }
-            let result: ManualSendOutcome.Result
-            switch error as? SenderError {
-            case .unconfirmedDelivery?, .interruptedSuccessResponse(_)?: result = .deliveryUnconfirmed
-            default: result = .failure
-            }
+            let result: ManualSendOutcome.Result = outcome == .deliveryUnconfirmed ? .deliveryUnconfirmed : .failure
             manualSendOutcome = ManualSendOutcome(id: attemptID, result: result)
             errorMessage = error.localizedDescription
         }

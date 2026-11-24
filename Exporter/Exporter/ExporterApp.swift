@@ -19,6 +19,7 @@ struct ExporterApp: App {
     }
 }
 
+@MainActor
 final class ExporterAppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCenterDelegate {
     let model = ExportModel()
     private var delivery: BackgroundDelivery?
@@ -33,13 +34,12 @@ final class ExporterAppDelegate: NSObject, UIApplicationDelegate, UNUserNotifica
 
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter,
                                             willPresent notification: UNNotification) async -> UNNotificationPresentationOptions {
-        switch notification.request.identifier {
-        case BackgroundSendNotifications.successIdentifier:
-            return [.list]
-        case BackgroundSendNotifications.failureIdentifier:
-            return [.banner, .list, .sound]
-        default:
-            return []
+        let request = notification.request
+        let identifier = request.identifier
+        let revision = BackgroundSendNotifications.revision(in: request)
+        // This callback only gates foreground presentation; iOS owns background delivery.
+        return await MainActor.run {
+            BackgroundSendNotifications.presentationOptions(for: identifier, revision: revision, settings: self.model.settings)
         }
     }
 }

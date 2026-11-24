@@ -211,12 +211,14 @@ struct SettingsView: View {
                         backgroundNotificationControls
                     }
                 } footer: {
-                    Text("开启后，健康数据更新时会自动发送所选且已授权的常规样本。首次推送可能包含历史数据；地址未配置或无效时不会推送。推送时机由系统决定。")
-                    if !settings.backgroundPushEnabled && draft != settings.endpointDraft {
-                        Text("若要开启推送，请先点「完成」保存地址和鉴权设置，再重新打开设置。")
-                    }
-                    if settings.backgroundPushEnabled {
-                        Text("打开「推送通知」后，连续两批未确认送达时会在本机提醒。打开「成功时也通知」后，成功也会提醒。通知不显示具体地址或健康数值。")
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("开启后，健康数据更新时会自动发送所选且已授权的常规样本。首次推送可能包含历史数据；地址未配置或无效时不会推送。推送时机由系统决定。")
+                        if !settings.backgroundPushEnabled && draft != settings.endpointDraft {
+                            Text("若要开启推送，请先点「完成」保存地址和鉴权设置，再重新打开设置。")
+                        }
+                        if settings.backgroundPushEnabled {
+                            Text("打开「推送通知」后，连续两批未确认送达时会在本机提醒。打开「成功时也通知」后，成功也会提醒。通知不显示具体地址或健康数值。")
+                        }
                     }
                 }
 

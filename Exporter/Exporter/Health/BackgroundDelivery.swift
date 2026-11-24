@@ -29,8 +29,9 @@ final class BackgroundDelivery {
         sender: { config, startAuthorization in BackgroundDelivery.makeSender(config, startAuthorization: startAuthorization) },
         commit: { [health, settings] outcome, receipt in
             health.commit(outcome, background: true)
-            settings.lastSendReceipt = receipt.dated(at: Date(), origin: .background)
+            settings.lastSendReceipt = receipt
         },
+        recordAttempt: { [settings] attempt in settings.lastSendAttempt = attempt },
         report: { [notifications] result in await notifications.report(result) },
         device: .init(model: UIDevice.current.model,
                       os: "\(UIDevice.current.systemName) \(UIDevice.current.systemVersion)"))

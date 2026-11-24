@@ -177,37 +177,75 @@ struct ContentView: View {
                 if let status = model.statusMessage {
                     Text(status)
                 }
-                if let receipt = model.settings.lastSendReceipt {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Label {
-                            if let confirmedAt = receipt.confirmedAt {
-                                let time = Self.sendDateFormatter.string(from: confirmedAt)
-                                if receipt.origin == .background {
-                                    Text("上次送达 · \(time) · 后台")
-                                } else {
-                                    Text("上次送达 · \(time)")
-                                }
-                            } else {
-                                Text("上次送达")
-                            }
-                        } icon: {
-                            Image(systemName: "checkmark.circle.fill")
-                                .foregroundStyle(.green)
-                                .accessibilityHidden(true)
-                        }
+                if let attempt = model.settings.lastSendAttempt {
+                    lastSendAttempt(attempt)
+                } else if let receipt = model.settings.lastSendReceipt {
+                    sendSummary(date: receipt.confirmedAt, origin: receipt.origin,
+                                symbol: "checkmark.circle.fill", color: .green) {
                         switch receipt.destination {
-                        case .primary:
-                            Text("主地址 · \(receipt.host)")
-                        case .backup:
-                            Text("备用地址 · \(receipt.host)")
+                        case .primary: Text("已送达 · 主地址 · \(receipt.host)")
+                        case .backup: Text("已送达 · 备用地址 · \(receipt.host)")
                         }
                     }
-                    .fixedSize(horizontal: false, vertical: true)
-                    .accessibilityElement(children: .combine)
-                    .accessibilityIdentifier("home.lastSendReceipt")
                 }
             }
         }
+    }
+
+    @ViewBuilder
+    private func lastSendAttempt(_ attempt: SendAttempt) -> some View {
+        switch attempt.outcome {
+        case .success(let count, let destination):
+            let host = attempt.confirmedHost(from: model.settings.lastSendReceipt)
+            sendSummary(date: attempt.date, origin: attempt.origin, symbol: "checkmark.circle.fill", color: .green) {
+                switch (destination, host) {
+                case (.primary, let host?): Text("已发送 \(count) 条样本 · 主地址 · \(host)")
+                case (.backup, let host?): Text("已发送 \(count) 条样本 · 备用地址 · \(host)")
+                case (.primary, nil): Text("已发送 \(count) 条样本 · 主地址")
+                case (.backup, nil): Text("已发送 \(count) 条样本 · 备用地址")
+                }
+            }
+        case .deliveryUnconfirmed:
+            sendSummary(date: attempt.date, origin: attempt.origin, symbol: "questionmark.circle.fill", color: .orange) {
+                Text("发送结果未确认 · 再发可能重复")
+            }
+        case .failure(let code):
+            sendSummary(date: attempt.date, origin: attempt.origin, symbol: "exclamationmark.triangle.fill", color: .red) {
+                if let code {
+                    Text("发送失败 · 服务器返回 \(code)")
+                } else {
+                    Text("发送失败")
+                }
+            }
+        }
+    }
+
+    private func sendSummary<Details: View>(date: Date?, origin: SendReceipt.Origin?, symbol: String, color: Color,
+                                            @ViewBuilder details: () -> Details) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Label {
+                if let date {
+                    let time = Self.sendDateFormatter.string(from: date)
+                    if origin == .background {
+                        Text("上次发送 · \(time) · 后台")
+                    } else {
+                        Text("上次发送 · \(time)")
+                    }
+                } else {
+                    Text("上次发送")
+                }
+            } icon: {
+                Image(systemName: symbol)
+                    .foregroundStyle(color)
+                    .accessibilityHidden(true)
+            }
+            details()
+                .foregroundStyle(.secondary)
+        }
+        .font(.footnote)
+        .fixedSize(horizontal: false, vertical: true)
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("home.lastSendReceipt")
     }
 
     private static let sendDateFormatter: DateFormatter = {

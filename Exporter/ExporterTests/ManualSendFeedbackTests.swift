@@ -24,7 +24,14 @@ struct ManualSendFeedbackTests {
         #expect(startedAt <= confirmation && confirmation <= Date())
         #expect(receipt == undated.dated(at: confirmation))
         #expect(outcome.result == .success(sampleCount: 3, destination: destination))
-        #expect(AppSettings(defaults: fixture.defaults).lastSendReceipt == receipt)
+        let restarted = AppSettings(defaults: try #require(UserDefaults(suiteName: fixture.suite)))
+        #expect(restarted.backgroundNotificationMode == .off)
+        #expect(restarted.lastSendReceipt == receipt)
+        let attempt = try #require(restarted.lastSendAttempt)
+        #expect(attempt == SendAttempt(date: confirmation, origin: .manual,
+                                       outcome: .success(sampleCount: 3, destination: destination)))
+        #expect(attempt.confirmedHost(from: restarted.lastSendReceipt) == undated.host)
+        #expect(attempt.confirmedHost(from: undated) == nil)
         #expect(fixture.model.settings.lastSyncDate == previousSync)
         #expect(fixture.model.errorMessage == nil)
         #expect(!fixture.model.isSending)
@@ -40,8 +47,18 @@ struct ManualSendFeedbackTests {
         await model.send()
         let first = try #require(model.manualSendOutcome)
         let receipt = try #require(model.settings.lastSendReceipt)
+        let firstAttempt = try #require(model.settings.lastSendAttempt)
+        let retryStartedAt = Date()
         await model.send()
 
+        let restarted = AppSettings(defaults: try #require(UserDefaults(suiteName: fixture.suite)))
+        let latest = try #require(restarted.lastSendAttempt)
+        #expect(restarted.backgroundNotificationMode == .off)
+        #expect(restarted.lastSendReceipt == receipt)
+        #expect(latest.origin == .manual && latest.outcome == .deliveryUnconfirmed)
+        #expect(retryStartedAt <= latest.date && latest.date <= Date())
+        #expect(latest != firstAttempt)
+        #expect(latest.confirmedHost(from: receipt) == nil)
         let uncertain = try #require(model.manualSendOutcome)
         #expect(sender.attempts == 2)
         #expect(uncertain.result == .deliveryUnconfirmed)
@@ -70,6 +87,7 @@ struct ManualSendFeedbackTests {
         let model = fixture.model
         #expect(model.settings.lastSendReceipt == SendReceipt(destination: .backup, host: "old.example.test"))
         #expect(model.settings.lastSendReceipt?.confirmedAt == nil)
+        #expect(model.settings.lastSendAttempt == nil)
         #expect(model.manualSendOutcome == nil)
 
         let background = SendReceipt(destination: .backup, host: "background.example.test").dated(at: Date())
@@ -86,18 +104,31 @@ struct ManualSendFeedbackTests {
 
     @Test(arguments: [false, true])
     func failureStripUsesTransportClassificationWithoutChangingAlert(interruptedSuccess: Bool) async throws {
+        let body = "private server response"
         let error: SenderError = interruptedSuccess
             ? .interruptedSuccessResponse(200)
-            : .httpStatus(500, body: nil)
+            : .httpStatus(500, body: body)
         let fixture = try Fixture(sender: StubSender { _ in throw error })
         defer { fixture.cleanUp() }
+        fixture.model.settings.authorizationHeader = "Bearer secret-fixture"
+        let prior = SendReceipt(destination: .backup, host: "prior.example.test")
+        fixture.model.settings.lastSendReceipt = prior
 
         await fixture.model.send()
 
         let outcome = try #require(fixture.model.manualSendOutcome)
         #expect(outcome.result == (interruptedSuccess ? .deliveryUnconfirmed : .failure))
         #expect(fixture.model.errorMessage == error.localizedDescription)
-        #expect(fixture.model.settings.lastSendReceipt == nil)
+        let defaults = try #require(UserDefaults(suiteName: fixture.suite))
+        let restarted = AppSettings(defaults: defaults)
+        #expect(restarted.backgroundNotificationMode == .off)
+        #expect(restarted.lastSendReceipt == prior)
+        #expect(restarted.lastSendAttempt?.outcome == (interruptedSuccess ? .deliveryUnconfirmed : .failure(httpStatus: 500)))
+        let stored = try #require(defaults.data(forKey: "settings.lastSendAttempt.v1"))
+        let encoded = String(decoding: stored, as: UTF8.self)
+        #expect(!encoded.contains(body))
+        #expect(!encoded.contains("receiver.example.test"))
+        #expect(!encoded.contains("secret-fixture"))
         fixture.model.errorMessage = nil
         #expect(fixture.model.manualSendOutcome?.id == outcome.id)
     }
@@ -110,12 +141,49 @@ struct ManualSendFeedbackTests {
 
         #expect(fixture.model.manualSendOutcome == nil)
         #expect(fixture.model.settings.lastSendReceipt == nil)
+        #expect(fixture.model.settings.lastSendAttempt == nil)
         #expect(fixture.model.errorMessage == nil)
         #expect(!fixture.model.isSending)
     }
 
+    @Test func taskCancelledBeforeManualSendDoesNotReachSender() async throws {
+        let fixture = try Fixture(sender: StubSender { _ in
+            Issue.record("A cancelled send must not reach the sender")
+            return SendReceipt(destination: .primary, host: "receiver.example.test")
+        })
+        defer { fixture.cleanUp() }
+        let task = Task { await fixture.model.send() }
+        task.cancel()
+        await task.value
+
+        #expect(fixture.model.settings.lastSendAttempt == nil)
+        #expect(fixture.model.settings.lastSendReceipt == nil)
+    }
+
     @Test(arguments: [false, true])
-    func closingPreviewWhileSendingSuppressesOutcomeAndAlertButPreservesConfirmedReceipt(confirmed: Bool) async throws {
+    func emptyOrMissingArtifactDoesNotReplaceAttempt(missing: Bool) async throws {
+        let fixture = try Fixture(sender: StubSender { _ in
+            Issue.record("An empty or unreadable artifact must not reach the sender")
+            return SendReceipt(destination: .primary, host: "receiver.example.test")
+        })
+        defer { fixture.cleanUp() }
+        let prior = SendAttempt(date: Date(timeIntervalSince1970: 123), origin: .background,
+                                outcome: .deliveryUnconfirmed)
+        fixture.model.settings.lastSendAttempt = prior
+        if missing {
+            try FileManager.default.removeItem(at: fixture.fileURL)
+        } else {
+            try Data().write(to: fixture.fileURL, options: .atomic)
+        }
+
+        await fixture.model.send()
+
+        #expect(fixture.model.settings.lastSendAttempt == prior)
+        #expect(fixture.model.settings.lastSendReceipt == nil)
+    }
+
+    @Test(arguments: [false, true])
+    func closingPreviewWhileSendingSuppressesPreviewFeedbackButPersistsAttempt(confirmed: Bool) async throws {
         let sender = ClosingSender()
         let fixture = try Fixture(sender: StubSender { _ in try await sender.respond(confirmed: confirmed) })
         defer { fixture.cleanUp() }
@@ -127,6 +195,8 @@ struct ManualSendFeedbackTests {
         #expect(fixture.model.manualSendOutcome == nil)
         #expect(fixture.model.errorMessage == nil)
         #expect((fixture.model.settings.lastSendReceipt?.confirmedAt != nil) == confirmed)
+        let restarted = AppSettings(defaults: try #require(UserDefaults(suiteName: fixture.suite)))
+        #expect(restarted.lastSendAttempt?.outcome == (confirmed ? .success(sampleCount: 3, destination: .primary) : .deliveryUnconfirmed))
         fixture.model.showPreview = true
         #expect(fixture.model.manualSendOutcome == nil)
     }

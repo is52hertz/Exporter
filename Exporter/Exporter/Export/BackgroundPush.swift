@@ -21,6 +21,8 @@ final class BackgroundPush {
     private let fetch: ([HealthMetric]) async throws -> HealthKitManager.FetchOutcome
     private let sender: (Configuration, POSTStartAuthorization) -> any ExportSender
     private let commit: (HealthKitManager.FetchOutcome, SendReceipt) -> Void
+    // Persist the completed send independently of local notification settings or awaits.
+    private let recordAttempt: (SendAttempt) -> Void
     private let report: (ResultNotice) async -> Void
     private let device: ExportDocument.DeviceInfo
     private let batchingDelay: Duration
@@ -33,6 +35,7 @@ final class BackgroundPush {
          fetch: @escaping ([HealthMetric]) async throws -> HealthKitManager.FetchOutcome,
          sender: @escaping (Configuration, POSTStartAuthorization) -> any ExportSender,
          commit: @escaping (HealthKitManager.FetchOutcome, SendReceipt) -> Void,
+         recordAttempt: @escaping (SendAttempt) -> Void = { _ in },
          report: @escaping (ResultNotice) async -> Void = { _ in },
          device: ExportDocument.DeviceInfo,
          batchingDelay: Duration = .seconds(2)) {
@@ -40,6 +43,7 @@ final class BackgroundPush {
         self.fetch = fetch
         self.sender = sender
         self.commit = commit
+        self.recordAttempt = recordAttempt
         self.report = report
         self.device = device
         self.batchingDelay = batchingDelay
@@ -146,13 +150,19 @@ final class BackgroundPush {
             receipt = try await sender(config, startAuthorization).send(data)
         } catch {
             guard isCurrent(config, startAuthorization), !isCancellation(error) else { return }
+            if let outcome = SendAttempt.Outcome(sendError: error) {
+                recordAttempt(SendAttempt(date: Date(), origin: .background, outcome: outcome))
+            }
             logger.error("Background push delivery was not confirmed; anchors were not advanced.")
             await report(.notConfirmed)
             return
         }
         guard isCurrent(config, startAuthorization) else { return }
-        commit(outcome, receipt)
+        let date = Date()
+        commit(outcome, receipt.dated(at: date, origin: .background))
         guard isCurrent(config, startAuthorization) else { return }
+        recordAttempt(SendAttempt(date: date, origin: .background,
+                                  outcome: .success(sampleCount: outcome.samples.count, destination: receipt.destination)))
         await report(.success(sampleCount: outcome.samples.count, destination: receipt.destination))
     }
 }
